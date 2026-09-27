@@ -1,0 +1,9 @@
+{
+  "yaoguang.options.title": "Yaoguang · Ray Tracing Settings",
+  "yaoguang.options.enable": "Enable Ray Tracing",
+  "yaoguang.options.preset": "Preset",
+  "yaoguang.options.denoiser": "Denoiser",
+  "yaoguang.options.bounces": "Max Bounces",
+  "yaoguang.options.raylength": "Ray Length",
+  "yaoguang.options.back": "Back"
+}

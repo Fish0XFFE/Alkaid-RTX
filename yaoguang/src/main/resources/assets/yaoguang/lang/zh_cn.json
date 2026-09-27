@@ -1,0 +1,9 @@
+{
+  "yaoguang.options.title": "瑶光 · 光线追踪设置",
+  "yaoguang.options.enable": "启用光线追踪",
+  "yaoguang.options.preset": "预设",
+  "yaoguang.options.denoiser": "降噪器",
+  "yaoguang.options.bounces": "最大反射次数",
+  "yaoguang.options.raylength": "光线",
+  "yaoguang.options.back": "返回"
+}
