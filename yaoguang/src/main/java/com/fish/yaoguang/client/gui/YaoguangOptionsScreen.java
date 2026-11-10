@@ -2,6 +2,7 @@ package com.fish.yaoguang.client.gui;
 
 import com.fish.yaoguang.YaoguangConfig;
 import com.fish.yaoguang.client.YaoguangClientEvents;
+import com.fish.yaoguang.nativebridge.YaoguangNative;
 import com.fish.yaoguang.util.VramExtender;
 import net.minecraft.client.gui.GuiGraphics;
 import net.minecraft.client.gui.components.Button;
@@ -11,18 +12,19 @@ import net.minecraft.network.chat.Component;
 
 public class YaoguangOptionsScreen extends Screen {
     private final Screen parent;
-    private Button bouncesBtn, sppBtn, rayLenBtn, vramSizeBtn;
+    private Button bouncesBtn, sppBtn, rayLenBtn, vramSizeBtn, renderScaleBtn, dlssBtn;
+    private boolean dlssAvailable;
     private CycleButton<RayTracingPreset> presetBtn;
     private CycleButton<Boolean> vramToggle, denoiserBtn, ptBtn, rtBtn;
 
     public YaoguangOptionsScreen(Screen parent) {
         super(Component.literal("瑶光 · 光线追踪设置"));
         this.parent = parent;
+        YaoguangClientEvents.ensureInitialized();
     }
 
     @Override
     protected void init() {
-        YaoguangClientEvents.ensureInitialized();
 
         int cx = this.width / 2;
         int w = Math.min(300, this.width - 40);
@@ -35,7 +37,7 @@ public class YaoguangOptionsScreen extends Screen {
         rtBtn = CycleButton.onOffBuilder(YaoguangConfig.isRayTracingEnabled())
                 .create(x, y, w, 20, Component.literal("启用光线追踪"),
                         (btn, val) -> { YaoguangConfig.setRayTracingEnabled(val); updateStates(); });
-        rtBtn.active = available;
+        rtBtn.active = true;
         addRenderableWidget(rtBtn);
         y += step;
 
@@ -49,7 +51,7 @@ public class YaoguangOptionsScreen extends Screen {
         y += step;
 
         ptBtn = CycleButton.onOffBuilder(YaoguangConfig.isPathTracingEnabled())
-                .create(x, y, w, 20, Component.literal("伽利略·路径追踪"),
+                .create(x, y, w, 20, Component.literal("路径追踪"),
                         (btn, val) -> { YaoguangConfig.setPathTracingEnabled(val); YaoguangConfig.markCustom(); refreshPreset(); });
         ptBtn.active = available;
         addRenderableWidget(ptBtn);
@@ -96,6 +98,29 @@ public class YaoguangOptionsScreen extends Screen {
         }).pos(x, y).size(w, 20).build();
         rayLenBtn.active = available;
         addRenderableWidget(rayLenBtn);
+        y += step;
+
+        renderScaleBtn = new Button.Builder(Component.literal("渲染比例: " + YaoguangConfig.getRenderScale() + "%"), b -> {
+            int next = YaoguangConfig.getRenderScale() - 10;
+            if (next < 50) next = 100;
+            YaoguangConfig.setRenderScale(next);
+            b.setMessage(Component.literal("渲染比例: " + next + "%"));
+        }).pos(x, y).size(w, 20).build();
+        renderScaleBtn.active = available;
+        addRenderableWidget(renderScaleBtn);
+        y += step;
+
+        try {
+            dlssAvailable = YaoguangClientEvents.isInitialized() && YaoguangNative.isDlssAvailable();
+        } catch (Throwable t) {
+            dlssAvailable = false;
+        }
+        dlssBtn = new Button.Builder(Component.literal(dlssLabel()), b -> {
+            YaoguangConfig.setDlssQuality((YaoguangConfig.getDlssQuality() + 1) % 6);
+            b.setMessage(Component.literal(dlssLabel()));
+        }).pos(x, y).size(w, 20).build();
+        dlssBtn.active = available && dlssAvailable;
+        addRenderableWidget(dlssBtn);
         y += step + 8;
 
         vramToggle = CycleButton.onOffBuilder(YaoguangConfig.isVramExtensionEnabled())
@@ -140,14 +165,28 @@ public class YaoguangOptionsScreen extends Screen {
         presetBtn.setValue(YaoguangConfig.getCurrentPreset());
     }
 
+    private String dlssLabel() {
+        String mode = YaoguangConfig.getDlssQualityName();
+        if (!dlssAvailable) return "DLSS: " + mode + "（不可用）";
+        return "DLSS: " + mode;
+    }
+
     private void updateStates() {
-        boolean on = YaoguangConfig.isRayTracingEnabled() && YaoguangClientEvents.isNativeAvailable();
+        boolean on = YaoguangConfig.isRayTracingEnabled();
         presetBtn.active = on;
         ptBtn.active = on;
+        denoiserBtn.active = on;
         bouncesBtn.active = on;
         sppBtn.active = on;
-        denoiserBtn.active = on;
         rayLenBtn.active = on;
+        renderScaleBtn.active = on;
+        try {
+            dlssAvailable = YaoguangNative.isDlssAvailable();
+        } catch (Throwable ignored) {
+            dlssAvailable = false;
+        }
+        dlssBtn.setMessage(Component.literal(dlssLabel()));
+        dlssBtn.active = on && dlssAvailable;
         vramSizeBtn.active = YaoguangConfig.isVramExtensionEnabled();
     }
 
@@ -162,7 +201,8 @@ public class YaoguangOptionsScreen extends Screen {
         } else {
             g.drawCenteredString(this.font,
                     Component.literal("§a" + YaoguangClientEvents.getDeviceName()
-                            + " · " + YaoguangClientEvents.getRayTracingUnitName()),
+                            + " · " + YaoguangClientEvents.getRayTracingUnitName()
+                            + " · NRD"),
                     this.width / 2, 32, 0x55FF55);
         }
 

@@ -18,4 +18,7 @@ public interface ParticleAccessor {
     @Accessor("bCol") float yaoguang$getBCol();
     @Accessor("age") int yaoguang$getAge();
     @Accessor("lifetime") int yaoguang$getLifetime();
+    @Accessor("bbWidth") float yaoguang$getBbWidth();
+    @Accessor("bbHeight") float yaoguang$getBbHeight();
+    @Accessor("alpha") float yaoguang$getAlpha();
 }

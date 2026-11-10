@@ -1,0 +1,250 @@
+#version 460
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(binding = 0, rgba16f) uniform writeonly image2D outCloud;
+layout(binding = 1) uniform sampler2D cloudHistory;
+layout(binding = 12) uniform sampler2D transmittanceLut;
+
+layout(push_constant) uniform PC {
+    uint maxBounces;
+    uint samplesPerPixel;
+    uint frameIndex;
+    uint flags;
+    float exposure;
+    float rayLength;
+    float sunIntensity;
+    float ambientIntensity;
+    vec4 camPos;
+    vec4 camDir;
+    vec4 camUp;
+    float fov;
+    float aspect;
+    float time;
+    float wetness;
+    uint dynamicCount;
+    uint particleCount;
+    uint pad0;
+    uint pad1;
+    vec4 sunDir;
+    vec4 weather;
+    vec4 prevCamPos;
+    vec4 prevCamDir;
+    vec4 prevCamUp;
+    vec4 lens;
+    vec4 misc;
+    vec4 sunColor;
+} pc;
+
+const float PI = 3.14159265358979;
+const float CLOUD_BASE = 400.0;
+const float CLOUD_TOP = 1500.0;
+const float CLOUD_EXTINCTION = 0.0052;
+const float CLOUD_ALBEDO = 0.985;
+
+float saturate(float v) { return clamp(v, 0.0, 1.0); }
+float luminance(vec3 c) { return dot(c, vec3(0.2126, 0.7152, 0.0722)); }
+
+float hash12(vec2 p) {
+    vec3 p3 = fract(vec3(p.xyx) * 0.1031);
+    p3 += dot(p3, p3.yzx + 33.33);
+    return fract((p3.x + p3.y) * p3.z);
+}
+
+float noise3(vec3 p) {
+    vec3 i = floor(p);
+    vec3 f = fract(p);
+    f = f * f * (3.0 - 2.0 * f);
+    float a = hash12(i.xy + i.z * 13.7);
+    float b = hash12(i.xy + vec2(1.0, 0.0) + i.z * 13.7);
+    float c = hash12(i.xy + vec2(0.0, 1.0) + i.z * 13.7);
+    float d = hash12(i.xy + vec2(1.0, 1.0) + i.z * 13.7);
+    float e = hash12(i.xy + (i.z + 1.0) * 13.7);
+    float g = hash12(i.xy + vec2(1.0, 0.0) + (i.z + 1.0) * 13.7);
+    float h = hash12(i.xy + vec2(0.0, 1.0) + (i.z + 1.0) * 13.7);
+    float k = hash12(i.xy + vec2(1.0, 1.0) + (i.z + 1.0) * 13.7);
+    float x0 = mix(a, b, f.x);
+    float x1 = mix(c, d, f.x);
+    float x2 = mix(e, g, f.x);
+    float x3 = mix(h, k, f.x);
+    return mix(mix(x0, x1, f.y), mix(x2, x3, f.y), f.z);
+}
+
+float fbm(vec3 p) {
+    float v = 0.0;
+    float a = 0.5;
+    for (int i = 0; i < 4; i++) {
+        v += a * noise3(p);
+        p *= 2.03;
+        a *= 0.5;
+    }
+    return v;
+}
+
+float atmosphereAltitudeKm(vec3 p) {
+    return max(p.y - 60.0, 0.0) * 0.001 + 0.12;
+}
+
+vec3 lutTransmittance(float altitudeKm, float mu) {
+    vec2 uv = vec2(sqrt(saturate(altitudeKm * (1.0 / 60.0))), saturate(mu * 0.5 + 0.5));
+    return texture(transmittanceLut, uv).rgb;
+}
+
+vec3 sunTransmittance(vec3 dir) {
+    return lutTransmittance(atmosphereAltitudeKm(pc.camPos.xyz), dir.y);
+}
+
+vec3 ambientSkyZenith(vec3 sun) {
+    float day = saturate(sun.y * 4.0);
+    float dayPower = day * day;
+    vec3 zenith = mix(vec3(0.020, 0.028, 0.052), vec3(0.40, 0.52, 0.90) * pc.sunIntensity * 0.040, dayPower);
+    vec3 ground = mix(vec3(0.009, 0.010, 0.014), vec3(0.22, 0.19, 0.15) * pc.sunIntensity * 0.026, dayPower);
+    vec3 color = mix(ground, zenith, 0.5);
+    float overcast = saturate(pc.weather.x);
+    color += vec3(0.30, 0.33, 0.38) * overcast * dayPower * 0.775;
+    color += vec3(0.018, 0.020, 0.024) * overcast * (1.0 - dayPower) * 0.7;
+    return color;
+}
+
+float cloudCoverage() {
+    if (pc.misc.z < 0.5) return 0.0;
+    return saturate(0.52 + pc.weather.x * 0.30 + pc.weather.y * 0.12);
+}
+
+float cloudDensity(vec3 p, float coverage) {
+    vec3 q = p * 0.0016;
+    float wA = pc.time * 0.130;
+    float wrapA = wA - floor(wA / 512.0) * 512.0;
+    float wrapB = pc.time * 0.075 - floor(pc.time * 0.150 / 512.0) * 512.0;
+    float wB = pc.time * 0.150;
+    float shear = fbm(vec3(q.x * 0.25 - pc.time * 0.020, q.y * 0.5, q.z * 0.25 + pc.time * 0.014));
+    vec2 drift = vec2(wrapA, wrapB) + (vec2(shear, shear * 0.7) - 0.5) * 0.45;
+    q.xz += drift;
+    q.y -= pc.time * 0.025;
+    float base = fbm(vec3(q.x, q.y * 0.95, q.z));
+    float detail = fbm(vec3(q.x * 2.6, q.y * 0.9, q.z * 2.6));
+    float evolve = fbm(vec3(q.x * 0.55 - pc.time * 0.026, q.y * 0.8 - pc.time * 0.015 + 11.3, q.z * 0.55 + pc.time * 0.020));
+    float d = base * 0.86 + detail * 0.06 + evolve * 0.08;
+    return smoothstep(1.0 - coverage + 0.04, 1.0 - coverage + 0.30, d);
+}
+
+float hgPhase(float mu, float g) {
+    float g2 = g * g;
+    return (1.0 - g2) / (12.566371 * pow(max(1.0 + g2 - 2.0 * g * mu, 1.0e-4), 1.5));
+}
+
+float cloudPhase(float mu) {
+    return 0.72 * hgPhase(mu, 0.62) + 0.28 * hgPhase(mu, -0.25);
+}
+
+float cloudScatterTransmittance(float od) {
+    return 0.52 * exp(-od) + 0.30 * exp(-od * 0.35) + 0.18 * exp(-od * 0.11);
+}
+
+float cloudSunOpticalDepth(vec3 p, vec3 sun, float coverage, int steps) {
+    float span = clamp((CLOUD_TOP - p.y) / max(sun.y, 0.10), 0.0, 560.0);
+    float dt = span / float(steps);
+    float densitySum = 0.0;
+    for (int i = 0; i < steps; i++) {
+        densitySum += cloudDensity(p + sun * (dt * (float(i) + 0.5)), coverage);
+    }
+    return densitySum * dt * CLOUD_EXTINCTION;
+}
+
+vec3 cloudLayer(vec3 origin, vec3 dir, vec3 sun, vec3 ambient, float coverage, int steps, out float cloudT) {
+    cloudT = 1.0;
+    if (coverage <= 0.002 || steps <= 0) return vec3(0.0);
+    if (dir.y < 0.02) return vec3(0.0);
+    float t0 = max((CLOUD_BASE - origin.y) / dir.y, 0.0);
+    float t1 = (CLOUD_TOP - origin.y) / dir.y;
+    if (t1 <= t0) return vec3(0.0);
+    t1 = min(t1, t0 + 6000.0);
+    float stepSize = (t1 - t0) / float(steps);
+    float mu = dot(dir, sun);
+    float phase = cloudPhase(mu);
+    float sunUp = max(sun.y, 0.0);
+    vec3 sunE = pc.sunColor.rgb * sunTransmittance(sun) * pc.sunIntensity;
+    vec3 moonE = vec3(0.062, 0.072, 0.104) * saturate(-sun.y) * (0.55 + 0.45 * saturate(dot(dir, normalize(-sun))));
+    float transmittance = 1.0;
+    vec3 sum = vec3(0.0);
+    for (int i = 0; i < steps; i++) {
+        vec3 p = origin + dir * (t0 + stepSize * (float(i) + 0.5));
+        float density = cloudDensity(p, coverage);
+        float dtau = density * CLOUD_EXTINCTION * stepSize;
+        if (dtau <= 0.002) continue;
+        float heightFraction = saturate((p.y - CLOUD_BASE) / (CLOUD_TOP - CLOUD_BASE));
+        float depthFade = mix(0.45, 1.0, heightFraction);
+        float sunOd = cloudSunOpticalDepth(p, sun, coverage, 2);
+        float directT = exp(-sunOd);
+        float multiT = cloudScatterTransmittance(sunOd);
+        float diffuseLight = sunUp * (1.0 - multiT) * (1.0 / PI) * CLOUD_ALBEDO * depthFade;
+        float ambientT = multiT * depthFade;
+        vec3 illumination = sunE * (1.0 + pc.weather.z * 2.4) * (phase * directT + diffuseLight) + ambient * ambientT + moonE * ambientT * (0.35 + 0.65 * phase * 12.566371 * 0.25);
+        sum += transmittance * (1.0 - exp(-dtau)) * CLOUD_ALBEDO * illumination;
+        transmittance *= exp(-dtau);
+        if (transmittance < 0.01) break;
+    }
+    cloudT = transmittance;
+    return sum * smoothstep(0.01, 0.09, dir.y);
+}
+
+vec3 cameraRay(vec2 uv) {
+    vec3 dir = normalize(pc.camDir.xyz);
+    vec3 up = normalize(pc.camUp.xyz);
+    vec3 right = normalize(cross(dir, up));
+    up = cross(right, dir);
+    float tanHalf = tan(radians(pc.fov) * 0.5);
+    vec2 ndc = uv * 2.0 - 1.0;
+    return normalize(dir + right * (ndc.x * tanHalf * pc.aspect) + up * (ndc.y * tanHalf));
+}
+
+vec3 prevCameraRay(vec2 uv) {
+    vec3 dir = normalize(pc.prevCamDir.xyz);
+    vec3 up = normalize(pc.prevCamUp.xyz);
+    vec3 right = normalize(cross(dir, up));
+    up = cross(right, dir);
+    float tanHalf = tan(radians(pc.fov) * 0.5);
+    vec2 ndc = uv * 2.0 - 1.0;
+    return normalize(dir + right * (ndc.x * tanHalf * pc.aspect) + up * (ndc.y * tanHalf));
+}
+
+vec2 projectPrev(vec3 dir) {
+    vec3 fwd = normalize(pc.prevCamDir.xyz);
+    vec3 up = normalize(pc.prevCamUp.xyz);
+    vec3 right = normalize(cross(fwd, up));
+    up = cross(right, fwd);
+    vec3 d = normalize(dir);
+    float z = dot(d, fwd);
+    if (z <= 0.001) return vec2(-1.0);
+    float tanHalf = tan(radians(pc.fov) * 0.5);
+    vec2 ndc = vec2(dot(d, right) / (z * tanHalf * pc.aspect), dot(d, up) / (z * tanHalf));
+    return ndc * 0.5 + 0.5;
+}
+
+void main() {
+    ivec2 store = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 size = imageSize(outCloud);
+    if (store.x >= size.x || store.y >= size.y) return;
+    vec2 uv = (vec2(store) + 0.5) / vec2(size);
+    vec3 dir = cameraRay(uv);
+    vec3 sun = normalize(pc.sunDir.xyz);
+    float coverage = cloudCoverage();
+    float cloudT = 1.0;
+    vec3 color = vec3(0.0);
+    if (coverage > 0.002) {
+        vec3 ambient = ambientSkyZenith(sun) * 0.6;
+        color = cloudLayer(pc.camPos.xyz, dir, sun, ambient, coverage, 2, cloudT);
+    }
+
+    vec2 prevUv = projectPrev(dir);
+    if (prevUv.x > 0.0 && prevUv.x < 1.0 && prevUv.y > 0.0 && prevUv.y < 1.0) {
+        vec4 history = texture(cloudHistory, prevUv);
+        if (dot(prevCameraRay(prevUv), dir) > 0.9995 && history.a > 0.0) {
+            float weight = 0.80;
+            color = mix(color, history.rgb, weight);
+            cloudT = mix(cloudT, history.a, weight);
+        }
+    }
+
+    imageStore(outCloud, store, vec4(color, cloudT));
+}

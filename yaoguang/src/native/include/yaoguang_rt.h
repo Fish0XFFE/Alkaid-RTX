@@ -20,6 +20,9 @@ JNIEXPORT void JNICALL Java_com_fish_yaoguang_nativebridge_YaoguangNative_setExp
 JNIEXPORT void JNICALL Java_com_fish_yaoguang_nativebridge_YaoguangNative_setPathTracingEnabled(JNIEnv*, jclass, jboolean);
 JNIEXPORT void JNICALL Java_com_fish_yaoguang_nativebridge_YaoguangNative_setVramExtension(JNIEnv*, jclass, jboolean, jint);
 JNIEXPORT void JNICALL Java_com_fish_yaoguang_nativebridge_YaoguangNative_onFrameBegin(JNIEnv*, jclass, jlong, jint, jint);
+JNIEXPORT void JNICALL Java_com_fish_yaoguang_nativebridge_YaoguangNative_setRenderScale(JNIEnv*, jclass, jfloat);
+JNIEXPORT void JNICALL Java_com_fish_yaoguang_nativebridge_YaoguangNative_setDlssQuality(JNIEnv*, jclass, jint);
+JNIEXPORT jboolean JNICALL Java_com_fish_yaoguang_nativebridge_YaoguangNative_isDlssAvailable(JNIEnv*, jclass);
 JNIEXPORT void JNICALL Java_com_fish_yaoguang_nativebridge_YaoguangNative_onFrameEnd(JNIEnv*, jclass);
 JNIEXPORT void JNICALL Java_com_fish_yaoguang_nativebridge_YaoguangNative_rebuildSceneAccel(JNIEnv*, jclass, jlong, jlong, jint, jint);
 JNIEXPORT jboolean JNICALL Java_com_fish_yaoguang_nativebridge_YaoguangNative_isRayTracingSupported(JNIEnv*, jclass);
@@ -35,14 +38,23 @@ JNIEXPORT jlong JNICALL Java_com_fish_yaoguang_nativebridge_YaoguangNative_getSh
 JNIEXPORT jlong JNICALL Java_com_fish_yaoguang_nativebridge_YaoguangNative_getVkSignalSemaphoreHandle(JNIEnv*, jclass);
 JNIEXPORT jlong JNICALL Java_com_fish_yaoguang_nativebridge_YaoguangNative_getGlSignalSemaphoreHandle(JNIEnv*, jclass);
 JNIEXPORT void JNICALL Java_com_fish_yaoguang_nativebridge_YaoguangNative_uploadSceneGeometry(JNIEnv*, jclass, jfloatArray, jintArray);
+JNIEXPORT void JNICALL Java_com_fish_yaoguang_nativebridge_YaoguangNative_reserveScene(JNIEnv*, jclass, jint, jint);
+JNIEXPORT void JNICALL Java_com_fish_yaoguang_nativebridge_YaoguangNative_beginChunkBatch(JNIEnv*, jclass);
+JNIEXPORT void JNICALL Java_com_fish_yaoguang_nativebridge_YaoguangNative_uploadChunkGeometry(JNIEnv*, jclass, jint, jint, jint, jfloatArray, jintArray);
+JNIEXPORT void JNICALL Java_com_fish_yaoguang_nativebridge_YaoguangNative_removeChunkGeometry(JNIEnv*, jclass, jint);
+JNIEXPORT void JNICALL Java_com_fish_yaoguang_nativebridge_YaoguangNative_commitChunkBatch(JNIEnv*, jclass);
 JNIEXPORT void JNICALL Java_com_fish_yaoguang_nativebridge_YaoguangNative_setSun(JNIEnv*, jclass, jfloat, jfloat, jfloat, jfloat);
-JNIEXPORT void JNICALL Java_com_fish_yaoguang_nativebridge_YaoguangNative_setWeather(JNIEnv*, jclass, jfloat, jfloat);
+JNIEXPORT void JNICALL Java_com_fish_yaoguang_nativebridge_YaoguangNative_setWeather(JNIEnv*, jclass, jfloat, jfloat, jfloat);
+JNIEXPORT void JNICALL Java_com_fish_yaoguang_nativebridge_YaoguangNative_setDimension(JNIEnv*, jclass, jint);
+JNIEXPORT void JNICALL Java_com_fish_yaoguang_nativebridge_YaoguangNative_setEnvironment(JNIEnv*, jclass, jfloat, jfloat, jfloat, jfloat, jfloat, jfloat, jfloat, jfloat);
 JNIEXPORT void JNICALL Java_com_fish_yaoguang_nativebridge_YaoguangNative_uploadBlockAtlas(JNIEnv*, jclass, jint, jint, jobject);
+JNIEXPORT void JNICALL Java_com_fish_yaoguang_nativebridge_YaoguangNative_uploadBlockAtlasLevel0(JNIEnv*, jclass, jint, jint, jobject);
 JNIEXPORT void JNICALL Java_com_fish_yaoguang_nativebridge_YaoguangNative_uploadDynamic(JNIEnv*, jclass, jobject, jint);
 JNIEXPORT void JNICALL Java_com_fish_yaoguang_nativebridge_YaoguangNative_clearDynamic(JNIEnv*, jclass);
 JNIEXPORT void JNICALL Java_com_fish_yaoguang_nativebridge_YaoguangNative_uploadParticleAtlas(JNIEnv*, jclass, jint, jint, jobject);
 JNIEXPORT void JNICALL Java_com_fish_yaoguang_nativebridge_YaoguangNative_uploadParticles(JNIEnv*, jclass, jobject, jint);
 JNIEXPORT void JNICALL Java_com_fish_yaoguang_nativebridge_YaoguangNative_clearParticles(JNIEnv*, jclass);
+JNIEXPORT jboolean JNICALL Java_com_fish_yaoguang_nativebridge_YaoguangNative_isDeviceLost(JNIEnv*, jclass);
 
 #ifdef __cplusplus
 }

@@ -5,6 +5,7 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.Paths;
 import java.nio.file.StandardCopyOption;
 
 public final class NativeLoader {
@@ -13,6 +14,7 @@ public final class NativeLoader {
 
     public static synchronized void load() {
         if (loaded) return;
+        System.out.println("[Yaoguang] NativeLoader.load begin");
 
         String os = System.getProperty("os.name").toLowerCase();
         String arch = System.getProperty("os.arch").toLowerCase();
@@ -42,13 +44,45 @@ public final class NativeLoader {
             }
             tmpLib.toFile().deleteOnExit();
 
+            if (os.contains("win")) {
+                String dlss = "native/windows/x86_64/nvngx_dlss.dll";
+                Path tmpDlss = nativeDir.resolve("nvngx_dlss.dll");
+                boolean copied = false;
+                try (InputStream is = NativeLoader.class.getClassLoader().getResourceAsStream(dlss)) {
+                    if (is != null) {
+                        Files.copy(is, tmpDlss, StandardCopyOption.REPLACE_EXISTING);
+                        tmpDlss.toFile().deleteOnExit();
+                        copied = true;
+                        System.out.println("[Yaoguang] nvngx_dlss.dll bundled in jar");
+                    }
+                }
+                if (!copied) {
+                    for (Path candidate : dlssCandidates()) {
+                        if (!Files.isRegularFile(candidate)) continue;
+                        Files.copy(candidate, tmpDlss, StandardCopyOption.REPLACE_EXISTING);
+                        tmpDlss.toFile().deleteOnExit();
+                        copied = true;
+                        System.out.println("[Yaoguang] nvngx_dlss.dll taken from " + candidate);
+                        break;
+                    }
+                }
+                if (!copied) {
+                    System.out.println("[Yaoguang] nvngx_dlss.dll not found - DLSS disabled, "
+                            + "put the file at config/yaoguang/native/nvngx_dlss.dll to enable it");
+                }
+            }
+
             Path shaderDir = nativeDir.resolve("shaders");
             Files.createDirectories(shaderDir);
 
             String[] shaders = {
                     "ray_gen.rgen.spv",
                     "closest_hit.rchit.spv",
-                    "miss.rmiss.spv"
+                    "alpha_test.rahit.spv",
+                    "miss.rmiss.spv",
+                    "combine.comp.spv",
+                    "composite.comp.spv",
+                    "cloud.comp.spv"
             };
             for (String s : shaders) {
                 String path = "native/shaders/" + s;
@@ -74,6 +108,28 @@ public final class NativeLoader {
 
     public static Path getNativeDir() {
         return nativeDir;
+    }
+
+    private static java.util.List<Path> dlssCandidates() {
+        java.util.List<Path> list = new java.util.ArrayList<>();
+        String explicit = System.getenv("YAOGUANG_NGX_DLL");
+        if (explicit != null && !explicit.isEmpty()) {
+            list.add(Paths.get(explicit));
+        }
+        Path gameDir = null;
+        try {
+            gameDir = net.minecraftforge.fml.loading.FMLPaths.GAMEDIR.get();
+        } catch (Throwable ignored) {
+        }
+        if (gameDir == null) {
+            String userDir = System.getProperty("user.dir");
+            if (userDir != null) gameDir = Paths.get(userDir);
+        }
+        if (gameDir != null) {
+            list.add(gameDir.resolve("config").resolve("yaoguang").resolve("native").resolve("nvngx_dlss.dll"));
+            list.add(gameDir.resolve("yaoguang").resolve("native").resolve("nvngx_dlss.dll"));
+        }
+        return list;
     }
 
     private NativeLoader() {}

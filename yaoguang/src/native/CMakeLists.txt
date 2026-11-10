@@ -7,13 +7,18 @@ set(CMAKE_CONFIGURATION_TYPES "Release" CACHE STRING "" FORCE)
 
 find_package(Vulkan REQUIRED)
 
-set(JAVA_HOME "E:/Program Files/Java/jdk-17" CACHE PATH "JDK path")
+if(DEFINED ENV{JAVA_HOME})
+    set(_YAOGUANG_DEFAULT_JAVA_HOME "$ENV{JAVA_HOME}")
+else()
+    set(_YAOGUANG_DEFAULT_JAVA_HOME "")
+endif()
+set(JAVA_HOME "${_YAOGUANG_DEFAULT_JAVA_HOME}" CACHE PATH "JDK path (set JAVA_HOME or pass -DJAVA_HOME=...)")
 
 if(NOT EXISTS "${JAVA_HOME}/include/jni.h")
     message(FATAL_ERROR "jni.h not found at ${JAVA_HOME}/include/jni.h")
 endif()
 
-set(NRD_DIR "${CMAKE_CURRENT_SOURCE_DIR}/externals/nrd")
+set(NRD_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../../externals/nrd")
 
 if(NOT EXISTS "${NRD_DIR}/CMakeLists.txt")
     message(FATAL_ERROR "NRD not found at ${NRD_DIR}")
@@ -27,7 +32,7 @@ set(NRD_SAMPLES               OFF CACHE BOOL "" FORCE)
 set(NRD_TESTS                 OFF CACHE BOOL "" FORCE)
 set(NRD_INTEGRATION           OFF CACHE BOOL "" FORCE)
 
-set(DXC_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/externals/dxc")
+set(DXC_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../../externals/dxc")
 set(DXC_EXE  "${DXC_ROOT}/bin/x64/dxc.exe" CACHE FILEPATH "" FORCE)
 
 set(SHADERMAKE_FIND_DXC    OFF CACHE BOOL "" FORCE)
@@ -45,14 +50,14 @@ endif()
 message(STATUS "[Yaoguang] Using local DXC: ${DXC_EXE}")
 
 set(FETCHCONTENT_SOURCE_DIR_SHADERMAKE
-    "${CMAKE_CURRENT_SOURCE_DIR}/externals/shadermake" CACHE PATH "" FORCE)
+    "${CMAKE_CURRENT_SOURCE_DIR}/../../externals/shadermake" CACHE PATH "" FORCE)
 set(FETCHCONTENT_SOURCE_DIR_MATHLIB
-    "${CMAKE_CURRENT_SOURCE_DIR}/externals/mathlib"    CACHE PATH "" FORCE)
+    "${CMAKE_CURRENT_SOURCE_DIR}/../../externals/mathlib"    CACHE PATH "" FORCE)
 
-if(NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/externals/shadermake/CMakeLists.txt")
+if(NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/../../externals/shadermake/CMakeLists.txt")
     message(FATAL_ERROR "shadermake source missing")
 endif()
-if(NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/externals/mathlib/CMakeLists.txt")
+if(NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/../../externals/mathlib/CMakeLists.txt")
     message(FATAL_ERROR "mathlib source missing")
 endif()
 
@@ -71,6 +76,8 @@ add_library(yaoguang_rt SHARED
     src/VulkanOpenGLInterop.cpp
     src/SceneAccel.cpp
     src/RayTracingPipeline.cpp
+    src/NrdDenoiser.cpp
+    src/DlssUpscaler.cpp
 )
 
 target_include_directories(yaoguang_rt PRIVATE
@@ -79,6 +86,7 @@ target_include_directories(yaoguang_rt PRIVATE
     "${JAVA_HOME}/include"
     "${JAVA_HOME}/include/win32"
     "${NRD_DIR}/Include"
+    "${CMAKE_CURRENT_SOURCE_DIR}/../../externals/dlss/include"
 )
 
 target_link_libraries(yaoguang_rt PRIVATE
@@ -91,6 +99,8 @@ target_link_libraries(yaoguang_rt PRIVATE
 )
 
 target_compile_definitions(yaoguang_rt PRIVATE
+    NOMINMAX
+    WIN32_LEAN_AND_MEAN
     YAOGUANG_VERSION="1.0.0"
     VK_USE_PLATFORM_WIN32_KHR=1
     NRD_EMBEDS_SPIRV_SHADERS=1
@@ -121,6 +131,74 @@ set_target_properties(yaoguang_rt PROPERTIES
     LIBRARY_OUTPUT_DIRECTORY "${OUT_DIR}"
 )
 
+add_executable(dlss_diag EXCLUDE_FROM_ALL test/dlss_diag.cpp src/VulkanContext.cpp)
+target_include_directories(dlss_diag PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+    ${Vulkan_INCLUDE_DIRS}
+    "${CMAKE_CURRENT_SOURCE_DIR}/../../externals/dlss/include"
+)
+target_compile_definitions(dlss_diag PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN VK_USE_PLATFORM_WIN32_KHR=1)
+target_link_libraries(dlss_diag PRIVATE Vulkan::Vulkan)
+if(MSVC)
+    target_compile_options(dlss_diag PRIVATE /W3 /wd4996 /O2 /MD /utf-8)
+endif()
+set_target_properties(dlss_diag PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/../../build-native"
+    RUNTIME_OUTPUT_DIRECTORY_RELEASE "${CMAKE_CURRENT_SOURCE_DIR}/../../build-native"
+)
+
+add_executable(dlss_pipeline_test EXCLUDE_FROM_ALL test/dlss_pipeline_test.cpp src/VulkanContext.cpp src/DlssUpscaler.cpp)
+target_include_directories(dlss_pipeline_test PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+    ${Vulkan_INCLUDE_DIRS}
+    "${CMAKE_CURRENT_SOURCE_DIR}/../../externals/dlss/include"
+)
+target_compile_definitions(dlss_pipeline_test PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN VK_USE_PLATFORM_WIN32_KHR=1)
+target_link_libraries(dlss_pipeline_test PRIVATE Vulkan::Vulkan)
+if(MSVC)
+    target_compile_options(dlss_pipeline_test PRIVATE /W3 /wd4996 /O2 /MD /utf-8)
+endif()
+set_target_properties(dlss_pipeline_test PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/../../build-native"
+    RUNTIME_OUTPUT_DIRECTORY_RELEASE "${CMAKE_CURRENT_SOURCE_DIR}/../../build-native"
+)
+
+add_executable(nrd_info EXCLUDE_FROM_ALL test/nrd_info.cpp)
+target_include_directories(nrd_info PRIVATE
+    ${Vulkan_INCLUDE_DIRS}
+    "${NRD_DIR}/Include"
+)
+target_compile_definitions(nrd_info PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
+target_link_libraries(nrd_info PRIVATE Vulkan::Vulkan NRD)
+if(MSVC)
+    target_compile_options(nrd_info PRIVATE /W3 /wd4996 /O2 /MD /utf-8)
+    set_target_properties(nrd_info PROPERTIES MSVC_RUNTIME_LIBRARY "MultiThreadedDLL")
+endif()
+set_target_properties(nrd_info PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/../../build-native"
+    RUNTIME_OUTPUT_DIRECTORY_RELEASE "${CMAKE_CURRENT_SOURCE_DIR}/../../build-native"
+)
+
+add_executable(nrd_run_test EXCLUDE_FROM_ALL test/nrd_run_test.cpp src/VulkanContext.cpp src/NrdDenoiser.cpp)
+target_include_directories(nrd_run_test PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+    ${Vulkan_INCLUDE_DIRS}
+    "${NRD_DIR}/Include"
+)
+target_compile_definitions(nrd_run_test PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN VK_USE_PLATFORM_WIN32_KHR=1)
+target_link_libraries(nrd_run_test PRIVATE Vulkan::Vulkan NRD)
+if(MSVC)
+    target_compile_options(nrd_run_test PRIVATE /W3 /wd4996 /O2 /MD /utf-8)
+    set_target_properties(nrd_run_test PROPERTIES MSVC_RUNTIME_LIBRARY "MultiThreadedDLL")
+endif()
+set_target_properties(nrd_run_test PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/../../build-native"
+    RUNTIME_OUTPUT_DIRECTORY_RELEASE "${CMAKE_CURRENT_SOURCE_DIR}/../../build-native"
+)
+
 find_program(GLSLC_EXECUTABLE glslc HINTS ${Vulkan_GLSLC_EXECUTABLE})
 if(NOT GLSLC_EXECUTABLE)
     find_program(GLSLC_EXECUTABLE glslc PATHS "$ENV{VULKAN_SDK}/Bin" "$ENV{VULKAN_SDK}/bin")
@@ -130,7 +208,11 @@ if(GLSLC_EXECUTABLE)
     set(SHADER_FILES
         ${SHADER_DIR}/ray_gen.rgen
         ${SHADER_DIR}/closest_hit.rchit
+        ${SHADER_DIR}/alpha_test.rahit
         ${SHADER_DIR}/miss.rmiss
+        ${SHADER_DIR}/combine.comp
+        ${SHADER_DIR}/composite.comp
+        ${SHADER_DIR}/cloud.comp
     )
 
     set(SPV_OUTPUTS "")

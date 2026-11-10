@@ -1,5 +1,6 @@
 package com.fish.yaoguang.client;
 
+import com.fish.yaoguang.YaoguangConfig;
 import com.fish.yaoguang.nativebridge.NativeLoader;
 import com.fish.yaoguang.nativebridge.YaoguangNative;
 
@@ -28,6 +29,7 @@ public final class YaoguangClientEvents {
 
             boolean ok = YaoguangNative.init();
             if (ok) {
+                YaoguangConfig.applyAll();
                 initialized = true;
                 return true;
             }
@@ -38,6 +40,10 @@ public final class YaoguangClientEvents {
             initFailed = true;
             return false;
         }
+    }
+
+    public static boolean isInitialized() {
+        return initialized;
     }
 
     public static boolean isNativeAvailable() {

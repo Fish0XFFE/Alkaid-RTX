@@ -2,11 +2,20 @@
 #include "VulkanContext.h"
 #include "VulkanOpenGLInterop.h"
 #include "SceneAccel.h"
+#include "NrdDenoiser.h"
+#include "DlssUpscaler.h"
 
-#include <fstream>
-#include <vector>
+#include <algorithm>
+#include <chrono>
 #include <cstring>
+#include <fstream>
 #include <iostream>
+#include <vector>
+
+namespace {
+constexpr uint32_t MAX_DYNAMIC = 4096;
+constexpr uint32_t MAX_PARTICLES = 4096;
+}
 
 RayTracingPipeline::RayTracingPipeline() = default;
 
@@ -25,10 +34,10 @@ VkDeviceAddress RayTracingPipeline::getBufferAddress(VkBuffer buffer) {
 VkShaderModule RayTracingPipeline::loadShader(const std::string& path) {
     std::ifstream file(path, std::ios::binary | std::ios::ate);
     if (!file.is_open()) {
-        std::cerr << "[Yaoguang] Cannot open shader: " << path << std::endl;
+        std::cerr << "[Yaoguang] cannot open shader: " << path << std::endl;
         return VK_NULL_HANDLE;
     }
-    size_t size = (size_t)file.tellg();
+    size_t size = static_cast<size_t>(file.tellg());
     file.seekg(0);
     std::vector<char> buffer(size);
     file.read(buffer.data(), size);
@@ -40,7 +49,7 @@ VkShaderModule RayTracingPipeline::loadShader(const std::string& path) {
 
     VkShaderModule module = VK_NULL_HANDLE;
     if (vkCreateShaderModule(m_device, &info, nullptr, &module) != VK_SUCCESS) return VK_NULL_HANDLE;
-    std::cout << "[Yaoguang] Shader loaded: " << path << " (" << size << " bytes)" << std::endl;
+    std::cout << "[Yaoguang] shader loaded: " << path << " (" << size << " bytes)" << std::endl;
     return module;
 }
 
@@ -66,213 +75,9 @@ void RayTracingPipeline::createSyncObjects() {
     vkCreateFence(m_device, &fenceInfo, nullptr, &m_fence);
 }
 
-void RayTracingPipeline::ensureDynamicBuffer(uint32_t count) {
-    if (count <= m_dynamicCapacity && m_dynamicBuffer != VK_NULL_HANDLE) return;
+void RayTracingPipeline::createDescriptorLayout() {
+    VkDescriptorSetLayoutBinding bindings[14]{};
 
-    uint32_t newCap = count < 256 ? 256 : count * 2;
-    if (newCap > 4096) newCap = 4096;
-
-    if (m_dynamicMapped) {
-        vkUnmapMemory(m_device, m_dynamicMemory);
-        m_dynamicMapped = nullptr;
-    }
-    if (m_dynamicBuffer) {
-        vkDestroyBuffer(m_device, m_dynamicBuffer, nullptr);
-        m_dynamicBuffer = VK_NULL_HANDLE;
-    }
-    if (m_dynamicMemory) {
-        vkFreeMemory(m_device, m_dynamicMemory, nullptr);
-        m_dynamicMemory = VK_NULL_HANDLE;
-    }
-
-    VkDeviceSize size = (VkDeviceSize)newCap * 8 * sizeof(float);
-
-    VkBufferCreateInfo bi{};
-    bi.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
-    bi.size = size;
-    bi.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
-               VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT |
-               VK_BUFFER_USAGE_TRANSFER_DST_BIT;
-    bi.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
-    if (vkCreateBuffer(m_device, &bi, nullptr, &m_dynamicBuffer) != VK_SUCCESS) return;
-
-    VkMemoryRequirements mr;
-    vkGetBufferMemoryRequirements(m_device, m_dynamicBuffer, &mr);
-
-    VkPhysicalDeviceMemoryProperties mprops;
-    vkGetPhysicalDeviceMemoryProperties(m_physicalDevice, &mprops);
-
-    uint32_t mt = UINT32_MAX;
-    VkMemoryPropertyFlags flags = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
-                                   VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
-    for (uint32_t i = 0; i < mprops.memoryTypeCount; i++) {
-        if ((mr.memoryTypeBits & (1u << i)) &&
-            (mprops.memoryTypes[i].propertyFlags & flags) == flags) {
-            mt = i; break;
-        }
-    }
-    if (mt == UINT32_MAX) return;
-
-    VkMemoryAllocateFlagsInfo af{};
-    af.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO;
-    af.flags = VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT;
-
-    VkMemoryAllocateInfo ma{};
-    ma.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
-    ma.pNext = &af;
-    ma.allocationSize = mr.size;
-    ma.memoryTypeIndex = mt;
-    if (vkAllocateMemory(m_device, &ma, nullptr, &m_dynamicMemory) != VK_SUCCESS) return;
-
-    vkBindBufferMemory(m_device, m_dynamicBuffer, m_dynamicMemory, 0);
-    if (vkMapMemory(m_device, m_dynamicMemory, 0, size, 0, &m_dynamicMapped) != VK_SUCCESS ||
-        !m_dynamicMapped) {
-        std::cerr << "[Yaoguang] ensureDynamicBuffer: failed to map dynamic buffer" << std::endl;
-        vkFreeMemory(m_device, m_dynamicMemory, nullptr);
-        m_dynamicMemory = VK_NULL_HANDLE;
-        vkDestroyBuffer(m_device, m_dynamicBuffer, nullptr);
-        m_dynamicBuffer = VK_NULL_HANDLE;
-        m_dynamicMapped = nullptr;
-        return;
-    }
-    m_dynamicAddress = getBufferAddress(m_dynamicBuffer);
-    m_dynamicCapacity = newCap;
-
-    updateDescriptorSet();
-}
-
-void RayTracingPipeline::ensureParticleBuffer(uint32_t count) {
-    if (count <= m_particleCapacity && m_particleBuffer != VK_NULL_HANDLE) return;
-
-    uint32_t newCap = count < 1024 ? 1024 : count * 2;
-    if (newCap > 16384) newCap = 16384;
-
-    if (m_particleMapped) {
-        vkUnmapMemory(m_device, m_particleMemory);
-        m_particleMapped = nullptr;
-    }
-    if (m_particleBuffer) {
-        vkDestroyBuffer(m_device, m_particleBuffer, nullptr);
-        m_particleBuffer = VK_NULL_HANDLE;
-    }
-    if (m_particleMemory) {
-        vkFreeMemory(m_device, m_particleMemory, nullptr);
-        m_particleMemory = VK_NULL_HANDLE;
-    }
-
-    VkDeviceSize size = (VkDeviceSize)newCap * 8 * sizeof(float);
-
-    VkBufferCreateInfo bi{};
-    bi.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
-    bi.size = size;
-    bi.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
-               VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT |
-               VK_BUFFER_USAGE_TRANSFER_DST_BIT;
-    bi.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
-    if (vkCreateBuffer(m_device, &bi, nullptr, &m_particleBuffer) != VK_SUCCESS) return;
-
-    VkMemoryRequirements mr;
-    vkGetBufferMemoryRequirements(m_device, m_particleBuffer, &mr);
-
-    VkPhysicalDeviceMemoryProperties mprops;
-    vkGetPhysicalDeviceMemoryProperties(m_physicalDevice, &mprops);
-
-    uint32_t mt = UINT32_MAX;
-    VkMemoryPropertyFlags flags = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
-                                   VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
-    for (uint32_t i = 0; i < mprops.memoryTypeCount; i++) {
-        if ((mr.memoryTypeBits & (1u << i)) &&
-            (mprops.memoryTypes[i].propertyFlags & flags) == flags) {
-            mt = i; break;
-        }
-    }
-    if (mt == UINT32_MAX) return;
-
-    VkMemoryAllocateFlagsInfo af{};
-    af.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO;
-    af.flags = VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT;
-
-    VkMemoryAllocateInfo ma{};
-    ma.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
-    ma.pNext = &af;
-    ma.allocationSize = mr.size;
-    ma.memoryTypeIndex = mt;
-    if (vkAllocateMemory(m_device, &ma, nullptr, &m_particleMemory) != VK_SUCCESS) return;
-
-    vkBindBufferMemory(m_device, m_particleBuffer, m_particleMemory, 0);
-    if (vkMapMemory(m_device, m_particleMemory, 0, size, 0, &m_particleMapped) != VK_SUCCESS ||
-        !m_particleMapped) {
-        std::cerr << "[Yaoguang] ensureParticleBuffer: failed to map particle buffer" << std::endl;
-        vkFreeMemory(m_device, m_particleMemory, nullptr);
-        m_particleMemory = VK_NULL_HANDLE;
-        vkDestroyBuffer(m_device, m_particleBuffer, nullptr);
-        m_particleBuffer = VK_NULL_HANDLE;
-        m_particleMapped = nullptr;
-        return;
-    }
-    m_particleAddress = getBufferAddress(m_particleBuffer);
-    m_particleCapacity = newCap;
-
-    updateDescriptorSet();
-}
-
-void RayTracingPipeline::uploadDynamic(const void* data, uint32_t count) {
-    if (count == 0) { clearDynamic(); return; }
-    ensureDynamicBuffer(count);
-    if (m_dynamicBuffer == VK_NULL_HANDLE || !m_dynamicMapped) return;
-    uint32_t n = count > m_dynamicCapacity ? m_dynamicCapacity : count;
-    std::memcpy(m_dynamicMapped, data, (size_t)n * 8 * sizeof(float));
-    m_dynamicCount = n;
-}
-
-void RayTracingPipeline::clearDynamic() {
-    m_dynamicCount = 0;
-}
-
-void RayTracingPipeline::uploadParticles(const void* data, uint32_t count) {
-    if (count == 0) { m_particleCount = 0; return; }
-    ensureParticleBuffer(count);
-    if (m_particleBuffer == VK_NULL_HANDLE || !m_particleMapped) return;
-    uint32_t n = count > m_particleCapacity ? m_particleCapacity : count;
-    std::memcpy(m_particleMapped, data, (size_t)n * 8 * sizeof(float));
-    m_particleCount = n;
-}
-
-void RayTracingPipeline::clearParticles() { m_particleCount = 0; }
-
-void RayTracingPipeline::uploadParticleAtlas(const void*, uint32_t, uint32_t) {}
-
-void RayTracingPipeline::destroyParticleAtlas() {
-    destroyImageInternal(m_particleAtlasImage, m_particleAtlasMemory,
-                          m_particleAtlasImageView, m_particleAtlasReady);
-}
-
-void RayTracingPipeline::initialize(VulkanContext& ctx, SceneAccel& scene,
-                                     VulkanOpenGLInterop& interop) {
-    m_device = ctx.getDevice();
-    m_physicalDevice = ctx.getPhysicalDevice();
-    m_queue = ctx.getQueue();
-    m_queueFamilyIndex = ctx.getQueueFamilyIndex();
-    m_scene = &scene;
-    m_interop = &interop;
-
-    std::cout << "[Yaoguang] Shader asset dir: " << m_assetDir << std::endl;
-
-    m_vkCmdTraceRaysKHR = (PFN_vkCmdTraceRaysKHR)vkGetDeviceProcAddr(m_device, "vkCmdTraceRaysKHR");
-    if (!m_vkCmdTraceRaysKHR) {
-        std::cerr << "[Yaoguang] vkCmdTraceRaysKHR not available" << std::endl;
-        return;
-    }
-
-    createCommandResources();
-    createSyncObjects();
-
-    if (!ctx.supportsRayTracing()) return;
-
-    ensureDynamicBuffer(512);
-    ensureParticleBuffer(1024);
-
-    VkDescriptorSetLayoutBinding bindings[7] = {};
     bindings[0].binding = 0;
     bindings[0].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
     bindings[0].descriptorCount = 1;
@@ -283,61 +88,87 @@ void RayTracingPipeline::initialize(VulkanContext& ctx, SceneAccel& scene,
     bindings[1].descriptorCount = 1;
     bindings[1].stageFlags = VK_SHADER_STAGE_RAYGEN_BIT_KHR;
 
-    bindings[2].binding = 2;
-    bindings[2].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-    bindings[2].descriptorCount = 1;
-    bindings[2].stageFlags = VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR |
-                             VK_SHADER_STAGE_RAYGEN_BIT_KHR;
-
-    bindings[3].binding = 3;
-    bindings[3].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-    bindings[3].descriptorCount = 1;
-    bindings[3].stageFlags = VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR |
-                             VK_SHADER_STAGE_RAYGEN_BIT_KHR;
+    for (uint32_t i = 2; i <= 3; i++) {
+        bindings[i].binding = i;
+        bindings[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        bindings[i].descriptorCount = 1;
+        bindings[i].stageFlags = VK_SHADER_STAGE_RAYGEN_BIT_KHR | VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR |
+                                 VK_SHADER_STAGE_ANY_HIT_BIT_KHR;
+    }
 
     bindings[4].binding = 4;
     bindings[4].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
     bindings[4].descriptorCount = 1;
-    bindings[4].stageFlags = VK_SHADER_STAGE_RAYGEN_BIT_KHR;
+    bindings[4].stageFlags = VK_SHADER_STAGE_RAYGEN_BIT_KHR | VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR |
+                             VK_SHADER_STAGE_ANY_HIT_BIT_KHR;
 
-    bindings[5].binding = 5;
-    bindings[5].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-    bindings[5].descriptorCount = 1;
-    bindings[5].stageFlags = VK_SHADER_STAGE_RAYGEN_BIT_KHR;
+    for (uint32_t i = 5; i <= 6; i++) {
+        bindings[i].binding = i;
+        bindings[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        bindings[i].descriptorCount = 1;
+        bindings[i].stageFlags = VK_SHADER_STAGE_RAYGEN_BIT_KHR;
+    }
 
-    bindings[6].binding = 6;
-    bindings[6].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-    bindings[6].descriptorCount = 1;
-    bindings[6].stageFlags = VK_SHADER_STAGE_RAYGEN_BIT_KHR;
+    for (uint32_t i = 7; i <= 10; i++) {
+        bindings[i].binding = i;
+        bindings[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+        bindings[i].descriptorCount = 1;
+        bindings[i].stageFlags = VK_SHADER_STAGE_RAYGEN_BIT_KHR;
+    }
+
+    bindings[11].binding = 11;
+    bindings[11].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    bindings[11].descriptorCount = 1;
+    bindings[11].stageFlags = VK_SHADER_STAGE_RAYGEN_BIT_KHR | VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR |
+                              VK_SHADER_STAGE_ANY_HIT_BIT_KHR;
+
+    bindings[12].binding = 12;
+    bindings[12].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    bindings[12].descriptorCount = 1;
+    bindings[12].stageFlags = VK_SHADER_STAGE_RAYGEN_BIT_KHR | VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR |
+                              VK_SHADER_STAGE_ANY_HIT_BIT_KHR;
+
+    bindings[13].binding = 13;
+    bindings[13].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    bindings[13].descriptorCount = 1;
+    bindings[13].stageFlags = VK_SHADER_STAGE_RAYGEN_BIT_KHR | VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR |
+                              VK_SHADER_STAGE_ANY_HIT_BIT_KHR;
 
     VkDescriptorSetLayoutCreateInfo layoutInfo{};
     layoutInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
-    layoutInfo.bindingCount = 7;
+    layoutInfo.bindingCount = 14;
     layoutInfo.pBindings = bindings;
-    if (vkCreateDescriptorSetLayout(m_device, &layoutInfo, nullptr, &m_descriptorSetLayout) != VK_SUCCESS) return;
+    if (vkCreateDescriptorSetLayout(m_device, &layoutInfo, nullptr, &m_descriptorSetLayout) != VK_SUCCESS) {
+        return;
+    }
 
     VkPushConstantRange pushRange{};
-    pushRange.stageFlags = VK_SHADER_STAGE_RAYGEN_BIT_KHR | VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR | VK_SHADER_STAGE_MISS_BIT_KHR;
+    pushRange.stageFlags = VK_SHADER_STAGE_RAYGEN_BIT_KHR |
+                           VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR |
+                           VK_SHADER_STAGE_ANY_HIT_BIT_KHR |
+                           VK_SHADER_STAGE_MISS_BIT_KHR;
     pushRange.offset = 0;
     pushRange.size = sizeof(RtPushConstants);
 
-    VkPipelineLayoutCreateInfo plInfo{};
-    plInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
-    plInfo.setLayoutCount = 1;
-    plInfo.pSetLayouts = &m_descriptorSetLayout;
-    plInfo.pushConstantRangeCount = 1;
-    plInfo.pPushConstantRanges = &pushRange;
-    if (vkCreatePipelineLayout(m_device, &plInfo, nullptr, &m_pipelineLayout) != VK_SUCCESS) return;
+    VkPipelineLayoutCreateInfo pipelineLayoutInfo{};
+    pipelineLayoutInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+    pipelineLayoutInfo.setLayoutCount = 1;
+    pipelineLayoutInfo.pSetLayouts = &m_descriptorSetLayout;
+    pipelineLayoutInfo.pushConstantRangeCount = 1;
+    pipelineLayoutInfo.pPushConstantRanges = &pushRange;
+    if (vkCreatePipelineLayout(m_device, &pipelineLayoutInfo, nullptr, &m_pipelineLayout) != VK_SUCCESS) {
+        return;
+    }
 
-    VkDescriptorPoolSize poolSizes[4] = {};
+    VkDescriptorPoolSize poolSizes[4]{};
     poolSizes[0].type = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
-    poolSizes[0].descriptorCount = 1;
+    poolSizes[0].descriptorCount = 5;
     poolSizes[1].type = VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR;
     poolSizes[1].descriptorCount = 1;
     poolSizes[2].type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-    poolSizes[2].descriptorCount = 4;
+    poolSizes[2].descriptorCount = 5;
     poolSizes[3].type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-    poolSizes[3].descriptorCount = 1;
+    poolSizes[3].descriptorCount = 2;
 
     VkDescriptorPoolCreateInfo poolInfo{};
     poolInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
@@ -346,37 +177,1413 @@ void RayTracingPipeline::initialize(VulkanContext& ctx, SceneAccel& scene,
     poolInfo.maxSets = 1;
     if (vkCreateDescriptorPool(m_device, &poolInfo, nullptr, &m_descriptorPool) != VK_SUCCESS) return;
 
-    VkDescriptorSetAllocateInfo allocInfo{};
-    allocInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
-    allocInfo.descriptorPool = m_descriptorPool;
-    allocInfo.descriptorSetCount = 1;
-    allocInfo.pSetLayouts = &m_descriptorSetLayout;
-    if (vkAllocateDescriptorSets(m_device, &allocInfo, &m_descriptorSet) != VK_SUCCESS) return;
+    VkDescriptorSetAllocateInfo allocateInfo{};
+    allocateInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+    allocateInfo.descriptorPool = m_descriptorPool;
+    allocateInfo.descriptorSetCount = 1;
+    allocateInfo.pSetLayouts = &m_descriptorSetLayout;
+    vkAllocateDescriptorSets(m_device, &allocateInfo, &m_descriptorSet);
+}
 
-    VkShaderModule rgen = loadShader(m_assetDir + "/shaders/ray_gen.rgen.spv");
-    VkShaderModule rchit = loadShader(m_assetDir + "/shaders/closest_hit.rchit.spv");
-    VkShaderModule rmiss = loadShader(m_assetDir + "/shaders/miss.rmiss.spv");
+void RayTracingPipeline::createCompositeResources() {
+    VkDescriptorSetLayoutBinding bindings[6]{};
+    bindings[0].binding = 0;
+    bindings[0].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    bindings[0].descriptorCount = 1;
+    bindings[0].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+    bindings[1].binding = 1;
+    bindings[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+    bindings[1].descriptorCount = 1;
+    bindings[1].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+    bindings[2].binding = 2;
+    bindings[2].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    bindings[2].descriptorCount = 1;
+    bindings[2].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+    bindings[3].binding = 3;
+    bindings[3].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    bindings[3].descriptorCount = 1;
+    bindings[3].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+    bindings[4].binding = 4;
+    bindings[4].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+    bindings[4].descriptorCount = 1;
+    bindings[4].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+    bindings[5].binding = 5;
+    bindings[5].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    bindings[5].descriptorCount = 1;
+    bindings[5].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
 
-    if (rgen == VK_NULL_HANDLE || rchit == VK_NULL_HANDLE || rmiss == VK_NULL_HANDLE) {
-        std::cerr << "[Yaoguang] Missing shaders" << std::endl;
+    VkDescriptorSetLayoutCreateInfo layoutInfo{};
+    layoutInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+    layoutInfo.bindingCount = 6;
+    layoutInfo.pBindings = bindings;
+    if (vkCreateDescriptorSetLayout(m_device, &layoutInfo, nullptr, &m_compositeSetLayout) != VK_SUCCESS) return;
+
+    VkPushConstantRange pushRange{};
+    pushRange.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+    pushRange.offset = 0;
+    pushRange.size = sizeof(CompositePushConstants);
+
+    VkPipelineLayoutCreateInfo pipelineLayoutInfo{};
+    pipelineLayoutInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+    pipelineLayoutInfo.setLayoutCount = 1;
+    pipelineLayoutInfo.pSetLayouts = &m_compositeSetLayout;
+    pipelineLayoutInfo.pushConstantRangeCount = 1;
+    pipelineLayoutInfo.pPushConstantRanges = &pushRange;
+    if (vkCreatePipelineLayout(m_device, &pipelineLayoutInfo, nullptr, &m_compositeLayout) != VK_SUCCESS) return;
+
+    VkDescriptorPoolSize poolSizes[2]{};
+    poolSizes[0].type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    poolSizes[0].descriptorCount = 4;
+    poolSizes[1].type = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+    poolSizes[1].descriptorCount = 2;
+
+    VkDescriptorPoolCreateInfo poolInfo{};
+    poolInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
+    poolInfo.poolSizeCount = 2;
+    poolInfo.pPoolSizes = poolSizes;
+    poolInfo.maxSets = 1;
+    if (vkCreateDescriptorPool(m_device, &poolInfo, nullptr, &m_compositePool) != VK_SUCCESS) return;
+
+    VkDescriptorSetAllocateInfo allocateInfo{};
+    allocateInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+    allocateInfo.descriptorPool = m_compositePool;
+    allocateInfo.descriptorSetCount = 1;
+    allocateInfo.pSetLayouts = &m_compositeSetLayout;
+    vkAllocateDescriptorSets(m_device, &allocateInfo, &m_compositeSet);
+
+    VkSamplerCreateInfo samplerInfo{};
+    samplerInfo.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
+    samplerInfo.magFilter = VK_FILTER_LINEAR;
+    samplerInfo.minFilter = VK_FILTER_LINEAR;
+    samplerInfo.addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+    samplerInfo.addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+    samplerInfo.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+    samplerInfo.maxLod = 0.0f;
+    vkCreateSampler(m_device, &samplerInfo, nullptr, &m_compositeSampler);
+
+    VkShaderModule shader = loadShader(m_assetDir + "/shaders/composite.comp.spv");
+    if (shader == VK_NULL_HANDLE) return;
+
+    VkComputePipelineCreateInfo pipelineInfo{};
+    pipelineInfo.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
+    pipelineInfo.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    pipelineInfo.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+    pipelineInfo.stage.module = shader;
+    pipelineInfo.stage.pName = "main";
+    pipelineInfo.layout = m_compositeLayout;
+    VkResult result = vkCreateComputePipelines(m_device, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &m_compositePipeline);
+    vkDestroyShaderModule(m_device, shader, nullptr);
+    if (result != VK_SUCCESS) {
+        std::cerr << "[Yaoguang] failed to create composite pipeline result=" << result << std::endl;
+    }
+}
+
+void RayTracingPipeline::createCombineResources() {
+    VkDescriptorSetLayoutBinding bindings[5]{};
+    for (uint32_t i = 0; i < 3; i++) {
+        bindings[i].binding = i;
+        bindings[i].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        bindings[i].descriptorCount = 1;
+        bindings[i].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+    }
+    for (uint32_t i = 3; i < 5; i++) {
+        bindings[i].binding = i;
+        bindings[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+        bindings[i].descriptorCount = 1;
+        bindings[i].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+    }
+
+    VkDescriptorSetLayoutCreateInfo layoutInfo{};
+    layoutInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+    layoutInfo.bindingCount = 5;
+    layoutInfo.pBindings = bindings;
+    if (vkCreateDescriptorSetLayout(m_device, &layoutInfo, nullptr, &m_combineSetLayout) != VK_SUCCESS) return;
+
+    VkPushConstantRange range{};
+    range.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+    range.offset = 0;
+    range.size = sizeof(CombinePushConstants);
+
+    VkPipelineLayoutCreateInfo pipelineLayoutInfo{};
+    pipelineLayoutInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+    pipelineLayoutInfo.setLayoutCount = 1;
+    pipelineLayoutInfo.pSetLayouts = &m_combineSetLayout;
+    pipelineLayoutInfo.pushConstantRangeCount = 1;
+    pipelineLayoutInfo.pPushConstantRanges = &range;
+    if (vkCreatePipelineLayout(m_device, &pipelineLayoutInfo, nullptr, &m_combineLayout) != VK_SUCCESS) return;
+
+    VkDescriptorPoolSize poolSizes[2]{};
+    poolSizes[0].type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    poolSizes[0].descriptorCount = 3;
+    poolSizes[1].type = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+    poolSizes[1].descriptorCount = 2;
+    VkDescriptorPoolCreateInfo poolInfo{};
+    poolInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
+    poolInfo.maxSets = 1;
+    poolInfo.poolSizeCount = 2;
+    poolInfo.pPoolSizes = poolSizes;
+    if (vkCreateDescriptorPool(m_device, &poolInfo, nullptr, &m_combinePool) != VK_SUCCESS) return;
+
+    VkDescriptorSetAllocateInfo allocateInfo{};
+    allocateInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+    allocateInfo.descriptorPool = m_combinePool;
+    allocateInfo.descriptorSetCount = 1;
+    allocateInfo.pSetLayouts = &m_combineSetLayout;
+    vkAllocateDescriptorSets(m_device, &allocateInfo, &m_combineSet);
+
+    VkShaderModule shader = loadShader(m_assetDir + "/shaders/combine.comp.spv");
+    if (shader == VK_NULL_HANDLE) return;
+
+    VkComputePipelineCreateInfo pipelineInfo{};
+    pipelineInfo.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
+    pipelineInfo.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    pipelineInfo.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+    pipelineInfo.stage.module = shader;
+    pipelineInfo.stage.pName = "main";
+    pipelineInfo.layout = m_combineLayout;
+    VkResult result = vkCreateComputePipelines(m_device, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &m_combinePipeline);
+    vkDestroyShaderModule(m_device, shader, nullptr);
+    if (result != VK_SUCCESS) {
+        std::cerr << "[Yaoguang] failed to create combine pipeline result=" << result << std::endl;
+    }
+}
+
+void RayTracingPipeline::destroyCombineResources() {
+    if (m_combinePool != VK_NULL_HANDLE) {
+        vkDestroyDescriptorPool(m_device, m_combinePool, nullptr);
+        m_combinePool = VK_NULL_HANDLE;
+        m_combineSet = VK_NULL_HANDLE;
+    }
+    if (m_combinePipeline != VK_NULL_HANDLE) {
+        vkDestroyPipeline(m_device, m_combinePipeline, nullptr);
+        m_combinePipeline = VK_NULL_HANDLE;
+    }
+    if (m_combineLayout != VK_NULL_HANDLE) {
+        vkDestroyPipelineLayout(m_device, m_combineLayout, nullptr);
+        m_combineLayout = VK_NULL_HANDLE;
+    }
+    if (m_combineSetLayout != VK_NULL_HANDLE) {
+        vkDestroyDescriptorSetLayout(m_device, m_combineSetLayout, nullptr);
+        m_combineSetLayout = VK_NULL_HANDLE;
+    }
+}
+
+bool RayTracingPipeline::createTarget(Target& target, uint32_t width, uint32_t height, VkFormat format) {
+    VkImageCreateInfo info{};
+    info.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+    info.imageType = VK_IMAGE_TYPE_2D;
+    info.format = format;
+    info.extent = {width, height, 1};
+    info.mipLevels = 1;
+    info.arrayLayers = 1;
+    info.samples = VK_SAMPLE_COUNT_1_BIT;
+    info.tiling = VK_IMAGE_TILING_OPTIMAL;
+    info.usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+    info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    info.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+
+    if (vkCreateImage(m_device, &info, nullptr, &target.image) != VK_SUCCESS) return false;
+
+    VkMemoryRequirements requirements{};
+    vkGetImageMemoryRequirements(m_device, target.image, &requirements);
+
+    VkPhysicalDeviceMemoryProperties properties{};
+    vkGetPhysicalDeviceMemoryProperties(m_physicalDevice, &properties);
+
+    uint32_t memoryType = UINT32_MAX;
+    for (uint32_t i = 0; i < properties.memoryTypeCount; i++) {
+        if ((requirements.memoryTypeBits & (1u << i)) &&
+            (properties.memoryTypes[i].propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)) {
+            memoryType = i;
+            break;
+        }
+    }
+    if (memoryType == UINT32_MAX) return false;
+
+    VkMemoryAllocateInfo allocate{};
+    allocate.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+    allocate.allocationSize = requirements.size;
+    allocate.memoryTypeIndex = memoryType;
+    if (vkAllocateMemory(m_device, &allocate, nullptr, &target.memory) != VK_SUCCESS) return false;
+    if (vkBindImageMemory(m_device, target.image, target.memory, 0) != VK_SUCCESS) return false;
+
+    VkImageViewCreateInfo viewInfo{};
+    viewInfo.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+    viewInfo.image = target.image;
+    viewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D;
+    viewInfo.format = format;
+    viewInfo.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    viewInfo.subresourceRange.baseMipLevel = 0;
+    viewInfo.subresourceRange.levelCount = 1;
+    viewInfo.subresourceRange.baseArrayLayer = 0;
+    viewInfo.subresourceRange.layerCount = 1;
+    if (vkCreateImageView(m_device, &viewInfo, nullptr, &target.view) != VK_SUCCESS) return false;
+
+    target.format = format;
+    target.initialized = false;
+    return true;
+}
+
+bool RayTracingPipeline::createTargets(uint32_t width, uint32_t height) {
+    if (width == 0 || height == 0) return false;
+    uint32_t outputWidth = m_interop != nullptr ? m_interop->getWidth() : width;
+    uint32_t outputHeight = m_interop != nullptr ? m_interop->getHeight() : height;
+    if (m_diffuse.image != VK_NULL_HANDLE && m_width == width && m_height == height &&
+        m_outputWidth == outputWidth && m_outputHeight == outputHeight) {
+        return true;
+    }
+
+    vkDeviceWaitIdle(m_device);
+    destroyTargets();
+    m_width = width;
+    m_height = height;
+    m_outputWidth = outputWidth;
+    m_outputHeight = outputHeight;
+
+    if (!createTarget(m_diffuse, width, height, VK_FORMAT_R16G16B16A16_SFLOAT)) return false;
+    if (!createTarget(m_specular, width, height, VK_FORMAT_R16G16B16A16_SFLOAT)) return false;
+    if (!createTarget(m_normalRough, width, height, VK_FORMAT_A2B10G10R10_UNORM_PACK32)) return false;
+    if (!createTarget(m_viewZ, width, height, VK_FORMAT_R32_SFLOAT)) return false;
+    if (!createTarget(m_motion, width, height, VK_FORMAT_R16G16_SFLOAT)) return false;
+    if (!createTarget(m_hdr, width, height, VK_FORMAT_R16G16B16A16_SFLOAT)) return false;
+    if (!createTarget(m_depth, width, height, VK_FORMAT_R32_SFLOAT)) return false;
+
+    if (!createTarget(m_taaHistory[0], outputWidth, outputHeight, VK_FORMAT_R16G16B16A16_SFLOAT)) return false;
+    if (!createTarget(m_taaHistory[1], outputWidth, outputHeight, VK_FORMAT_R16G16B16A16_SFLOAT)) return false;
+
+    if (!createCloudTarget((width + 1) / 2, (height + 1) / 2)) return false;
+
+    if (m_dlss && m_dlss->isAvailable()) {
+        if (!createTarget(m_dlssOutput, outputWidth, outputHeight, VK_FORMAT_R16G16B16A16_SFLOAT)) return false;
+        m_dlss->resize(width, height, outputWidth, outputHeight);
+    }
+
+    if (m_nrd && m_nrd->isInitialized()) {
+        m_nrd->resize(width, height);
+    }
+    m_targetsDirty = true;
+    return true;
+}
+
+void RayTracingPipeline::destroyTargets() {
+    auto destroy = [&](Target& target) {
+        if (target.view != VK_NULL_HANDLE) vkDestroyImageView(m_device, target.view, nullptr);
+        if (target.image != VK_NULL_HANDLE) vkDestroyImage(m_device, target.image, nullptr);
+        if (target.memory != VK_NULL_HANDLE) vkFreeMemory(m_device, target.memory, nullptr);
+        target = {};
+    };
+    destroy(m_diffuse);
+    destroy(m_specular);
+    destroy(m_normalRough);
+    destroy(m_viewZ);
+    destroy(m_motion);
+    destroy(m_hdr);
+    destroy(m_depth);
+    destroy(m_dlssOutput);
+    destroy(m_taaHistory[0]);
+    destroy(m_taaHistory[1]);
+    destroyCloudTarget();
+    m_taaIndex = 0;
+    m_taaReset = true;
+}
+
+void RayTracingPipeline::barrierToGeneral(VkCommandBuffer commandBuffer, Target& target) {
+    if (target.image == VK_NULL_HANDLE || target.initialized) return;
+
+    VkImageMemoryBarrier barrier{};
+    barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+    barrier.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    barrier.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+    barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    barrier.image = target.image;
+    barrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    barrier.subresourceRange.baseMipLevel = 0;
+    barrier.subresourceRange.levelCount = 1;
+    barrier.subresourceRange.baseArrayLayer = 0;
+    barrier.subresourceRange.layerCount = 1;
+    barrier.srcAccessMask = 0;
+    barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+    vkCmdPipelineBarrier(commandBuffer,
+                         VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                         VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                         0, 0, nullptr, 0, nullptr, 1, &barrier);
+    target.initialized = true;
+}
+
+
+bool RayTracingPipeline::createCloudTarget(uint32_t width, uint32_t height) {
+    if (width == 0 || height == 0) return false;
+    VkImageCreateInfo info{};
+    info.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+    info.imageType = VK_IMAGE_TYPE_2D;
+    info.format = VK_FORMAT_R16G16B16A16_SFLOAT;
+    info.extent = {width, height, 1};
+    info.mipLevels = 1;
+    info.arrayLayers = 1;
+    info.samples = VK_SAMPLE_COUNT_1_BIT;
+    info.tiling = VK_IMAGE_TILING_OPTIMAL;
+    info.usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT;
+    info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    info.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    if (vkCreateImage(m_device, &info, nullptr, &m_cloudImage[0]) != VK_SUCCESS) return false;
+    if (vkCreateImage(m_device, &info, nullptr, &m_cloudImage[1]) != VK_SUCCESS) return false;
+
+    VkMemoryRequirements requirements{};
+    vkGetImageMemoryRequirements(m_device, m_cloudImage[0], &requirements);
+    VkPhysicalDeviceMemoryProperties properties{};
+    vkGetPhysicalDeviceMemoryProperties(m_physicalDevice, &properties);
+    uint32_t memoryType = UINT32_MAX;
+    for (uint32_t i = 0; i < properties.memoryTypeCount; i++) {
+        if ((requirements.memoryTypeBits & (1u << i)) &&
+            (properties.memoryTypes[i].propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)) {
+            memoryType = i;
+            break;
+        }
+    }
+    if (memoryType == UINT32_MAX) return false;
+
+    VkMemoryAllocateInfo allocateInfo{};
+    allocateInfo.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+    allocateInfo.allocationSize = requirements.size;
+    allocateInfo.memoryTypeIndex = memoryType;
+    if (vkAllocateMemory(m_device, &allocateInfo, nullptr, &m_cloudMemory[0]) != VK_SUCCESS) return false;
+    if (vkAllocateMemory(m_device, &allocateInfo, nullptr, &m_cloudMemory[1]) != VK_SUCCESS) return false;
+    if (vkBindImageMemory(m_device, m_cloudImage[0], m_cloudMemory[0], 0) != VK_SUCCESS) return false;
+    if (vkBindImageMemory(m_device, m_cloudImage[1], m_cloudMemory[1], 0) != VK_SUCCESS) return false;
+
+    VkImageViewCreateInfo viewInfo{};
+    viewInfo.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+    viewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D;
+    viewInfo.format = VK_FORMAT_R16G16B16A16_SFLOAT;
+    viewInfo.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    viewInfo.image = m_cloudImage[0];
+    if (vkCreateImageView(m_device, &viewInfo, nullptr, &m_cloudView[0]) != VK_SUCCESS) return false;
+    viewInfo.image = m_cloudImage[1];
+    if (vkCreateImageView(m_device, &viewInfo, nullptr, &m_cloudView[1]) != VK_SUCCESS) return false;
+
+    if (m_cloudSampler == VK_NULL_HANDLE) {
+        VkSamplerCreateInfo samplerInfo{};
+        samplerInfo.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
+        samplerInfo.magFilter = VK_FILTER_NEAREST;
+        samplerInfo.minFilter = VK_FILTER_NEAREST;
+        samplerInfo.mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST;
+        samplerInfo.addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+        samplerInfo.addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+        samplerInfo.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+        samplerInfo.maxLod = 0.0f;
+        if (vkCreateSampler(m_device, &samplerInfo, nullptr, &m_cloudSampler) != VK_SUCCESS) {
+            m_cloudSampler = VK_NULL_HANDLE;
+            return false;
+        }
+    }
+
+    m_cloudWidth = width;
+    m_cloudHeight = height;
+    m_cloudInitialized = false;
+    m_cloudWriteIndex = 0;
+
+    if (m_cloudSet != VK_NULL_HANDLE) {
+        VkDescriptorImageInfo imageInfo{m_cloudSampler, m_cloudView[0], VK_IMAGE_LAYOUT_GENERAL};
+        VkDescriptorImageInfo historyInfo{m_cloudSampler, m_cloudView[1], VK_IMAGE_LAYOUT_GENERAL};
+        VkWriteDescriptorSet writes[2]{};
+        writes[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        writes[0].dstSet = m_cloudSet;
+        writes[0].dstBinding = 0;
+        writes[0].descriptorCount = 1;
+        writes[0].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+        writes[0].pImageInfo = &imageInfo;
+        writes[1].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        writes[1].dstSet = m_cloudSet;
+        writes[1].dstBinding = 1;
+        writes[1].descriptorCount = 1;
+        writes[1].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        writes[1].pImageInfo = &historyInfo;
+        vkUpdateDescriptorSets(m_device, 2, writes, 0, nullptr);
+    }
+    return true;
+}
+
+void RayTracingPipeline::destroyCloudTarget() {
+    for (int i = 0; i < 2; i++) {
+        if (m_cloudView[i] != VK_NULL_HANDLE) vkDestroyImageView(m_device, m_cloudView[i], nullptr);
+        if (m_cloudImage[i] != VK_NULL_HANDLE) vkDestroyImage(m_device, m_cloudImage[i], nullptr);
+        if (m_cloudMemory[i] != VK_NULL_HANDLE) vkFreeMemory(m_device, m_cloudMemory[i], nullptr);
+        m_cloudView[i] = VK_NULL_HANDLE;
+        m_cloudImage[i] = VK_NULL_HANDLE;
+        m_cloudMemory[i] = VK_NULL_HANDLE;
+    }
+    m_cloudWidth = 0;
+    m_cloudHeight = 0;
+    m_cloudInitialized = false;
+    m_cloudWriteIndex = 0;
+}
+
+void RayTracingPipeline::createCloudResources() {
+    VkDescriptorSetLayoutBinding bindings[3]{};
+    bindings[0].binding = 0;
+    bindings[0].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+    bindings[0].descriptorCount = 1;
+    bindings[0].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+    bindings[1].binding = 1;
+    bindings[1].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    bindings[1].descriptorCount = 1;
+    bindings[1].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+    bindings[2].binding = 12;
+    bindings[2].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    bindings[2].descriptorCount = 1;
+    bindings[2].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+
+    VkDescriptorSetLayoutCreateInfo layoutInfo{};
+    layoutInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+    layoutInfo.bindingCount = 3;
+    layoutInfo.pBindings = bindings;
+    if (vkCreateDescriptorSetLayout(m_device, &layoutInfo, nullptr, &m_cloudSetLayout) != VK_SUCCESS) return;
+
+    VkPushConstantRange range{};
+    range.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+    range.offset = 0;
+    range.size = sizeof(RtPushConstants);
+
+    VkPipelineLayoutCreateInfo pipelineLayoutInfo{};
+    pipelineLayoutInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+    pipelineLayoutInfo.setLayoutCount = 1;
+    pipelineLayoutInfo.pSetLayouts = &m_cloudSetLayout;
+    pipelineLayoutInfo.pushConstantRangeCount = 1;
+    pipelineLayoutInfo.pPushConstantRanges = &range;
+    if (vkCreatePipelineLayout(m_device, &pipelineLayoutInfo, nullptr, &m_cloudLayout) != VK_SUCCESS) return;
+
+    VkDescriptorPoolSize poolSizes[2]{};
+    poolSizes[0].type = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+    poolSizes[0].descriptorCount = 1;
+    poolSizes[1].type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    poolSizes[1].descriptorCount = 2;
+    VkDescriptorPoolCreateInfo poolInfo{};
+    poolInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
+    poolInfo.maxSets = 1;
+    poolInfo.poolSizeCount = 2;
+    poolInfo.pPoolSizes = poolSizes;
+    if (vkCreateDescriptorPool(m_device, &poolInfo, nullptr, &m_cloudPool) != VK_SUCCESS) return;
+
+    VkDescriptorSetAllocateInfo allocateInfo{};
+    allocateInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+    allocateInfo.descriptorPool = m_cloudPool;
+    allocateInfo.descriptorSetCount = 1;
+    allocateInfo.pSetLayouts = &m_cloudSetLayout;
+    if (vkAllocateDescriptorSets(m_device, &allocateInfo, &m_cloudSet) != VK_SUCCESS) return;
+
+    if (m_transmittanceLutView != VK_NULL_HANDLE) {
+        VkDescriptorImageInfo lutInfo{m_transmittanceLutSampler, m_transmittanceLutView,
+                                      VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
+        VkWriteDescriptorSet write{};
+        write.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        write.dstSet = m_cloudSet;
+        write.dstBinding = 12;
+        write.descriptorCount = 1;
+        write.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        write.pImageInfo = &lutInfo;
+        vkUpdateDescriptorSets(m_device, 1, &write, 0, nullptr);
+    }
+
+    VkShaderModule shader = loadShader(m_assetDir + "/shaders/cloud.comp.spv");
+    if (shader == VK_NULL_HANDLE) return;
+
+    VkComputePipelineCreateInfo pipelineInfo{};
+    pipelineInfo.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
+    pipelineInfo.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    pipelineInfo.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+    pipelineInfo.stage.module = shader;
+    pipelineInfo.stage.pName = "main";
+    pipelineInfo.layout = m_cloudLayout;
+    VkResult result = vkCreateComputePipelines(m_device, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &m_cloudPipeline);
+    vkDestroyShaderModule(m_device, shader, nullptr);
+    if (result != VK_SUCCESS) {
+        std::cerr << "[Yaoguang] failed to create cloud pipeline result=" << result << std::endl;
+    }
+}
+
+void RayTracingPipeline::destroyCloudResources() {
+    if (m_cloudPool != VK_NULL_HANDLE) {
+        vkDestroyDescriptorPool(m_device, m_cloudPool, nullptr);
+        m_cloudPool = VK_NULL_HANDLE;
+        m_cloudSet = VK_NULL_HANDLE;
+    }
+    if (m_cloudPipeline != VK_NULL_HANDLE) {
+        vkDestroyPipeline(m_device, m_cloudPipeline, nullptr);
+        m_cloudPipeline = VK_NULL_HANDLE;
+    }
+    if (m_cloudLayout != VK_NULL_HANDLE) {
+        vkDestroyPipelineLayout(m_device, m_cloudLayout, nullptr);
+        m_cloudLayout = VK_NULL_HANDLE;
+    }
+    if (m_cloudSetLayout != VK_NULL_HANDLE) {
+        vkDestroyDescriptorSetLayout(m_device, m_cloudSetLayout, nullptr);
+        m_cloudSetLayout = VK_NULL_HANDLE;
+    }
+    if (m_cloudSampler != VK_NULL_HANDLE) {
+        vkDestroySampler(m_device, m_cloudSampler, nullptr);
+        m_cloudSampler = VK_NULL_HANDLE;
+    }
+}
+
+void RayTracingPipeline::createAtlasSampler() {
+    if (m_atlasSampler != VK_NULL_HANDLE) return;
+    VkSamplerCreateInfo info{};
+    info.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
+    info.magFilter = VK_FILTER_NEAREST;
+    info.minFilter = VK_FILTER_LINEAR;
+    info.mipmapMode = VK_SAMPLER_MIPMAP_MODE_LINEAR;
+    info.addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+    info.addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+    info.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+    info.maxLod = 4.0f;
+    if (vkCreateSampler(m_device, &info, nullptr, &m_atlasSampler) != VK_SUCCESS) {
+        m_atlasSampler = VK_NULL_HANDLE;
+    }
+}
+
+bool RayTracingPipeline::createDummyAtlas() {
+    VkImageCreateInfo info{};
+    info.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+    info.imageType = VK_IMAGE_TYPE_2D;
+    info.format = VK_FORMAT_R8G8B8A8_SRGB;
+    info.extent = {1, 1, 1};
+    info.mipLevels = 1;
+    info.arrayLayers = 1;
+    info.samples = VK_SAMPLE_COUNT_1_BIT;
+    info.tiling = VK_IMAGE_TILING_OPTIMAL;
+    info.usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+    info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    info.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    if (vkCreateImage(m_device, &info, nullptr, &m_dummyAtlasImage) != VK_SUCCESS) return false;
+
+    VkMemoryRequirements requirements{};
+    vkGetImageMemoryRequirements(m_device, m_dummyAtlasImage, &requirements);
+    VkPhysicalDeviceMemoryProperties properties{};
+    vkGetPhysicalDeviceMemoryProperties(m_physicalDevice, &properties);
+    uint32_t memoryType = UINT32_MAX;
+    for (uint32_t i = 0; i < properties.memoryTypeCount; i++) {
+        if ((requirements.memoryTypeBits & (1u << i)) &&
+            (properties.memoryTypes[i].propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)) {
+            memoryType = i;
+            break;
+        }
+    }
+    if (memoryType == UINT32_MAX) return false;
+
+    VkMemoryAllocateInfo allocate{};
+    allocate.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+    allocate.allocationSize = requirements.size;
+    allocate.memoryTypeIndex = memoryType;
+    if (vkAllocateMemory(m_device, &allocate, nullptr, &m_dummyAtlasMemory) != VK_SUCCESS) return false;
+    if (vkBindImageMemory(m_device, m_dummyAtlasImage, m_dummyAtlasMemory, 0) != VK_SUCCESS) return false;
+
+    VkImageViewCreateInfo viewInfo{};
+    viewInfo.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+    viewInfo.image = m_dummyAtlasImage;
+    viewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D;
+    viewInfo.format = VK_FORMAT_R8G8B8A8_SRGB;
+    viewInfo.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    viewInfo.subresourceRange.levelCount = 1;
+    viewInfo.subresourceRange.layerCount = 1;
+    if (vkCreateImageView(m_device, &viewInfo, nullptr, &m_dummyAtlasView) != VK_SUCCESS) return false;
+
+    VkCommandBufferAllocateInfo allocateInfo{};
+    allocateInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+    allocateInfo.commandPool = m_commandPool;
+    allocateInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+    allocateInfo.commandBufferCount = 1;
+    VkCommandBuffer commandBuffer = VK_NULL_HANDLE;
+    vkAllocateCommandBuffers(m_device, &allocateInfo, &commandBuffer);
+
+    VkCommandBufferBeginInfo beginInfo{};
+    beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+    beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    vkBeginCommandBuffer(commandBuffer, &beginInfo);
+
+    VkImageMemoryBarrier barrier{};
+    barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+    barrier.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    barrier.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    barrier.image = m_dummyAtlasImage;
+    barrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    barrier.subresourceRange.levelCount = 1;
+    barrier.subresourceRange.layerCount = 1;
+    barrier.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    vkCmdPipelineBarrier(commandBuffer,
+                         VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                         VK_PIPELINE_STAGE_TRANSFER_BIT,
+                         0, 0, nullptr, 0, nullptr, 1, &barrier);
+
+    VkClearColorValue clear{};
+    clear.float32[0] = 1.0f;
+    clear.float32[1] = 1.0f;
+    clear.float32[2] = 1.0f;
+    clear.float32[3] = 1.0f;
+    VkImageSubresourceRange range{};
+    range.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    range.levelCount = 1;
+    range.layerCount = 1;
+    vkCmdClearColorImage(commandBuffer, m_dummyAtlasImage,
+                         VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &clear, 1, &range);
+
+    barrier.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    barrier.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+    vkCmdPipelineBarrier(commandBuffer,
+                         VK_PIPELINE_STAGE_TRANSFER_BIT,
+                         VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR,
+                         0, 0, nullptr, 0, nullptr, 1, &barrier);
+
+    vkEndCommandBuffer(commandBuffer);
+    VkSubmitInfo submitInfo{};
+    submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+    submitInfo.commandBufferCount = 1;
+    submitInfo.pCommandBuffers = &commandBuffer;
+    vkQueueSubmit(m_queue, 1, &submitInfo, VK_NULL_HANDLE);
+    vkQueueWaitIdle(m_queue);
+    vkFreeCommandBuffers(m_device, m_commandPool, 1, &commandBuffer);
+    return true;
+}
+
+static uint16_t lutFloatToHalf(float value) {
+    uint32_t bits = 0;
+    std::memcpy(&bits, &value, sizeof(bits));
+    uint32_t sign = (bits >> 16) & 0x8000u;
+    int32_t exponent = int32_t((bits >> 23) & 0xFFu) - 112;
+    uint32_t mantissa = bits & 0x7FFFFFu;
+    if (exponent <= 0) return uint16_t(sign);
+    if (exponent >= 31) return uint16_t(sign | 0x7C00u);
+    return uint16_t(sign | (uint32_t(exponent) << 10) | (mantissa >> 13));
+}
+
+static void lutTransmittance(float altitudeKm, float mu, float out[3]) {
+    const double RP = 6360.0;
+    const double RA = 6420.0;
+    const double BR[3] = {5.802e-3, 13.558e-3, 33.1e-3};
+    const double BM = 2.0e-3 * 1.11;
+    const double BO[3] = {0.650e-3, 1.881e-3, 0.085e-3};
+    const double r0 = RP + double(altitudeKm);
+    const double dy = double(mu);
+    const double dx = std::sqrt(std::max(0.0, 1.0 - dy * dy));
+    const double b = r0 * dy;
+    const double discA = b * b - (r0 * r0 - RA * RA);
+    if (discA < 0.0) {
+        out[0] = 1.0f;
+        out[1] = 1.0f;
+        out[2] = 1.0f;
+        return;
+    }
+    const double tExit = -b + std::sqrt(discA);
+    double tGround = 0.0;
+    bool blocked = false;
+    const double discG = b * b - (r0 * r0 - RP * RP);
+    if (discG >= 0.0) {
+        const double tg = -b - std::sqrt(discG);
+        if (tg > 0.0) {
+            tGround = tg;
+            blocked = true;
+        }
+    }
+    const double tEnd = blocked ? std::min(tExit, tGround) : tExit;
+    const int steps = 40;
+    const double dt = tEnd / double(steps);
+    double odR = 0.0;
+    double odM = 0.0;
+    double odO = 0.0;
+    for (int i = 0; i < steps; i++) {
+        const double t = dt * (double(i) + 0.5);
+        const double px = dx * t;
+        const double py = r0 + dy * t;
+        const double r = std::sqrt(px * px + py * py);
+        const double h = std::max(r - RP, 0.0);
+        odR += std::exp(-h / 8.0) * dt;
+        odM += std::exp(-h / 1.2) * dt;
+        odO += std::max(0.0, 1.0 - std::abs(h - 25.0) / 15.0) * dt;
+    }
+    for (int channel = 0; channel < 3; channel++) {
+        const double od = BR[channel] * odR + BM * odM + BO[channel] * odO;
+        out[channel] = blocked ? 0.0f : float(std::exp(-od));
+    }
+}
+
+bool RayTracingPipeline::createTransmittanceLut() {
+    if (m_device == VK_NULL_HANDLE) return false;
+    const uint32_t size = 64;
+    std::vector<uint16_t> texels(size_t(size) * size_t(size) * 4, 0);
+    for (uint32_t y = 0; y < size; y++) {
+        for (uint32_t x = 0; x < size; x++) {
+            const float u = (float(x) + 0.5f) / float(size);
+            const float v = (float(y) + 0.5f) / float(size);
+            const float altitudeKm = 60.0f * u * u;
+            const float mu = v * 2.0f - 1.0f;
+            float t[3] = {1.0f, 1.0f, 1.0f};
+            lutTransmittance(altitudeKm, mu, t);
+            const size_t index = (size_t(y) * size_t(size) + size_t(x)) * 4;
+            texels[index + 0] = lutFloatToHalf(t[0]);
+            texels[index + 1] = lutFloatToHalf(t[1]);
+            texels[index + 2] = lutFloatToHalf(t[2]);
+            texels[index + 3] = lutFloatToHalf(1.0f);
+        }
+    }
+
+    VkImageCreateInfo info{};
+    info.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+    info.imageType = VK_IMAGE_TYPE_2D;
+    info.format = VK_FORMAT_R16G16B16A16_SFLOAT;
+    info.extent = {size, size, 1};
+    info.mipLevels = 1;
+    info.arrayLayers = 1;
+    info.samples = VK_SAMPLE_COUNT_1_BIT;
+    info.tiling = VK_IMAGE_TILING_OPTIMAL;
+    info.usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+    info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    info.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    if (vkCreateImage(m_device, &info, nullptr, &m_transmittanceLutImage) != VK_SUCCESS) return false;
+
+    VkMemoryRequirements requirements{};
+    vkGetImageMemoryRequirements(m_device, m_transmittanceLutImage, &requirements);
+    VkPhysicalDeviceMemoryProperties properties{};
+    vkGetPhysicalDeviceMemoryProperties(m_physicalDevice, &properties);
+    uint32_t memoryType = UINT32_MAX;
+    for (uint32_t i = 0; i < properties.memoryTypeCount; i++) {
+        if ((requirements.memoryTypeBits & (1u << i)) &&
+            (properties.memoryTypes[i].propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)) {
+            memoryType = i;
+            break;
+        }
+    }
+    if (memoryType == UINT32_MAX) {
+        for (uint32_t i = 0; i < properties.memoryTypeCount; i++) {
+            if (requirements.memoryTypeBits & (1u << i)) {
+                memoryType = i;
+                break;
+            }
+        }
+    }
+    if (memoryType == UINT32_MAX) return false;
+
+    VkMemoryAllocateInfo allocate{};
+    allocate.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+    allocate.allocationSize = requirements.size;
+    allocate.memoryTypeIndex = memoryType;
+    if (vkAllocateMemory(m_device, &allocate, nullptr, &m_transmittanceLutMemory) != VK_SUCCESS) return false;
+    if (vkBindImageMemory(m_device, m_transmittanceLutImage, m_transmittanceLutMemory, 0) != VK_SUCCESS) return false;
+
+    VkSamplerCreateInfo samplerInfo{};
+    samplerInfo.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
+    samplerInfo.magFilter = VK_FILTER_LINEAR;
+    samplerInfo.minFilter = VK_FILTER_LINEAR;
+    samplerInfo.mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST;
+    samplerInfo.addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+    samplerInfo.addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+    samplerInfo.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+    samplerInfo.maxLod = 0.0f;
+    if (vkCreateSampler(m_device, &samplerInfo, nullptr, &m_transmittanceLutSampler) != VK_SUCCESS) return false;
+
+    VkImageViewCreateInfo viewInfo{};
+    viewInfo.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+    viewInfo.image = m_transmittanceLutImage;
+    viewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D;
+    viewInfo.format = VK_FORMAT_R16G16B16A16_SFLOAT;
+    viewInfo.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    viewInfo.subresourceRange.levelCount = 1;
+    viewInfo.subresourceRange.layerCount = 1;
+    if (vkCreateImageView(m_device, &viewInfo, nullptr, &m_transmittanceLutView) != VK_SUCCESS) return false;
+
+    const VkDeviceSize bytes = VkDeviceSize(texels.size() * sizeof(uint16_t));
+    VkBufferCreateInfo bufferInfo{};
+    bufferInfo.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+    bufferInfo.size = bytes;
+    bufferInfo.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
+    bufferInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    VkBuffer staging = VK_NULL_HANDLE;
+    if (vkCreateBuffer(m_device, &bufferInfo, nullptr, &staging) != VK_SUCCESS) return false;
+
+    VkMemoryRequirements stagingRequirements{};
+    vkGetBufferMemoryRequirements(m_device, staging, &stagingRequirements);
+    uint32_t stagingType = UINT32_MAX;
+    for (uint32_t i = 0; i < properties.memoryTypeCount; i++) {
+        if ((stagingRequirements.memoryTypeBits & (1u << i)) &&
+            (properties.memoryTypes[i].propertyFlags & (VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                                                        VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)) ==
+                (VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)) {
+            stagingType = i;
+            break;
+        }
+    }
+    if (stagingType == UINT32_MAX) {
+        vkDestroyBuffer(m_device, staging, nullptr);
+        return false;
+    }
+
+    VkMemoryAllocateInfo stagingAllocate{};
+    stagingAllocate.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+    stagingAllocate.allocationSize = stagingRequirements.size;
+    stagingAllocate.memoryTypeIndex = stagingType;
+    VkDeviceMemory stagingMemory = VK_NULL_HANDLE;
+    if (vkAllocateMemory(m_device, &stagingAllocate, nullptr, &stagingMemory) != VK_SUCCESS) {
+        vkDestroyBuffer(m_device, staging, nullptr);
+        return false;
+    }
+    if (vkBindBufferMemory(m_device, staging, stagingMemory, 0) != VK_SUCCESS) {
+        vkFreeMemory(m_device, stagingMemory, nullptr);
+        vkDestroyBuffer(m_device, staging, nullptr);
+        return false;
+    }
+    void* mapped = nullptr;
+    if (vkMapMemory(m_device, stagingMemory, 0, bytes, 0, &mapped) != VK_SUCCESS) {
+        vkFreeMemory(m_device, stagingMemory, nullptr);
+        vkDestroyBuffer(m_device, staging, nullptr);
+        return false;
+    }
+    std::memcpy(mapped, texels.data(), size_t(bytes));
+    vkUnmapMemory(m_device, stagingMemory);
+
+    VkCommandBufferAllocateInfo allocateInfo{};
+    allocateInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+    allocateInfo.commandPool = m_commandPool;
+    allocateInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+    allocateInfo.commandBufferCount = 1;
+    VkCommandBuffer commandBuffer = VK_NULL_HANDLE;
+    vkAllocateCommandBuffers(m_device, &allocateInfo, &commandBuffer);
+
+    VkCommandBufferBeginInfo beginInfo{};
+    beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+    beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    vkBeginCommandBuffer(commandBuffer, &beginInfo);
+
+    VkImageMemoryBarrier barrier{};
+    barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+    barrier.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    barrier.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    barrier.image = m_transmittanceLutImage;
+    barrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    barrier.subresourceRange.levelCount = 1;
+    barrier.subresourceRange.layerCount = 1;
+    barrier.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    vkCmdPipelineBarrier(commandBuffer,
+                         VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                         VK_PIPELINE_STAGE_TRANSFER_BIT,
+                         0, 0, nullptr, 0, nullptr, 1, &barrier);
+
+    VkBufferImageCopy region{};
+    region.bufferOffset = 0;
+    region.bufferRowLength = 0;
+    region.bufferImageHeight = 0;
+    region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    region.imageSubresource.mipLevel = 0;
+    region.imageSubresource.baseArrayLayer = 0;
+    region.imageSubresource.layerCount = 1;
+    region.imageOffset = {0, 0, 0};
+    region.imageExtent = {size, size, 1};
+    vkCmdCopyBufferToImage(commandBuffer, staging, m_transmittanceLutImage,
+                           VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
+
+    barrier.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    barrier.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+    vkCmdPipelineBarrier(commandBuffer,
+                         VK_PIPELINE_STAGE_TRANSFER_BIT,
+                         VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR,
+                         0, 0, nullptr, 0, nullptr, 1, &barrier);
+
+    vkEndCommandBuffer(commandBuffer);
+    VkSubmitInfo submitInfo{};
+    submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+    submitInfo.commandBufferCount = 1;
+    submitInfo.pCommandBuffers = &commandBuffer;
+    vkQueueSubmit(m_queue, 1, &submitInfo, VK_NULL_HANDLE);
+    vkQueueWaitIdle(m_queue);
+    vkFreeCommandBuffers(m_device, m_commandPool, 1, &commandBuffer);
+    vkFreeMemory(m_device, stagingMemory, nullptr);
+    vkDestroyBuffer(m_device, staging, nullptr);
+    return true;
+}
+
+void RayTracingPipeline::uploadImageInternal(const void* pixels, uint32_t w, uint32_t h,
+                                             VkImage& image, VkDeviceMemory& memory,
+                                             VkImageView& view, bool& ready) {
+    if (w == 0 || h == 0 || pixels == nullptr) return;
+    destroyImageInternal(image, memory, view, ready);
+    createAtlasSampler();
+
+    VkImageCreateInfo info{};
+    info.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+    info.imageType = VK_IMAGE_TYPE_2D;
+    uint32_t mipLevels = 1;
+    while (mipLevels < 5 && ((w >> mipLevels) > 0) && ((h >> mipLevels) > 0)) {
+        mipLevels++;
+    }
+
+    info.format = VK_FORMAT_R8G8B8A8_SRGB;
+    info.extent = {w, h, 1};
+    info.mipLevels = mipLevels;
+    info.arrayLayers = 1;
+    info.samples = VK_SAMPLE_COUNT_1_BIT;
+    info.tiling = VK_IMAGE_TILING_OPTIMAL;
+    info.usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
+                 VK_IMAGE_USAGE_SAMPLED_BIT;
+    info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    info.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    if (vkCreateImage(m_device, &info, nullptr, &image) != VK_SUCCESS) return;
+
+    VkMemoryRequirements requirements{};
+    vkGetImageMemoryRequirements(m_device, image, &requirements);
+    VkPhysicalDeviceMemoryProperties properties{};
+    vkGetPhysicalDeviceMemoryProperties(m_physicalDevice, &properties);
+    uint32_t memoryType = UINT32_MAX;
+    for (uint32_t i = 0; i < properties.memoryTypeCount; i++) {
+        if ((requirements.memoryTypeBits & (1u << i)) &&
+            (properties.memoryTypes[i].propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)) {
+            memoryType = i;
+            break;
+        }
+    }
+    if (memoryType == UINT32_MAX) return;
+
+    VkMemoryAllocateInfo allocate{};
+    allocate.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+    allocate.allocationSize = requirements.size;
+    allocate.memoryTypeIndex = memoryType;
+    if (vkAllocateMemory(m_device, &allocate, nullptr, &memory) != VK_SUCCESS) return;
+    if (vkBindImageMemory(m_device, image, memory, 0) != VK_SUCCESS) return;
+
+    const uint8_t* sourcePixels = static_cast<const uint8_t*>(pixels);
+    std::vector<std::vector<uint8_t>> levels;
+    levels.emplace_back(sourcePixels, sourcePixels + static_cast<size_t>(w) * h * 4);
+    const uint32_t tileSize = 16;
+    for (uint32_t level = 1; level < mipLevels; level++) {
+        uint32_t pw = std::max(1u, w >> (level - 1));
+        uint32_t ph = std::max(1u, h >> (level - 1));
+        uint32_t cw = std::max(1u, w >> level);
+        uint32_t ch = std::max(1u, h >> level);
+        const std::vector<uint8_t>& prev = levels.back();
+        std::vector<uint8_t> next(static_cast<size_t>(cw) * ch * 4, 0);
+        uint32_t shift = level - 1;
+        for (uint32_t y = 0; y < ch; y++) {
+            for (uint32_t x = 0; x < cw; x++) {
+                uint32_t bx = x << level;
+                uint32_t by = y << level;
+                uint32_t tx0 = (bx / tileSize) * tileSize;
+                uint32_t ty0 = (by / tileSize) * tileSize;
+                uint32_t lx0 = tx0 >> shift;
+                uint32_t ly0 = ty0 >> shift;
+                uint32_t lx1 = std::min(pw - 1, ((tx0 + tileSize) >> shift) - 1);
+                uint32_t ly1 = std::min(ph - 1, ((ty0 + tileSize) >> shift) - 1);
+                uint32_t sum[4] = {0, 0, 0, 0};
+                uint32_t count = 0;
+                for (uint32_t sy = y * 2; sy < y * 2 + 2; sy++) {
+                    for (uint32_t sx = x * 2; sx < x * 2 + 2; sx++) {
+                        uint32_t cx = std::min(std::max(sx, lx0), lx1);
+                        uint32_t cy = std::min(std::max(sy, ly0), ly1);
+                        const uint8_t* p = &prev[(static_cast<size_t>(cy) * pw + cx) * 4];
+                        sum[0] += p[0];
+                        sum[1] += p[1];
+                        sum[2] += p[2];
+                        sum[3] += p[3];
+                        count++;
+                    }
+                }
+                uint8_t* o = &next[(static_cast<size_t>(y) * cw + x) * 4];
+                for (int c = 0; c < 4; c++) o[c] = static_cast<uint8_t>(sum[c] / std::max(count, 1u));
+            }
+        }
+        levels.push_back(std::move(next));
+    }
+
+    VkDeviceSize bytes = 0;
+    for (const auto& level : levels) bytes += level.size();
+    VkBuffer staging = VK_NULL_HANDLE;
+    VkDeviceMemory stagingMemory = VK_NULL_HANDLE;
+    VkBufferCreateInfo bufferInfo{};
+    bufferInfo.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+    bufferInfo.size = bytes;
+    bufferInfo.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
+    if (vkCreateBuffer(m_device, &bufferInfo, nullptr, &staging) != VK_SUCCESS) return;
+
+    VkMemoryRequirements bufferRequirements{};
+    vkGetBufferMemoryRequirements(m_device, staging, &bufferRequirements);
+    uint32_t bufferMemoryType = UINT32_MAX;
+    VkMemoryPropertyFlags flags = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+    for (uint32_t i = 0; i < properties.memoryTypeCount; i++) {
+        if ((bufferRequirements.memoryTypeBits & (1u << i)) &&
+            (properties.memoryTypes[i].propertyFlags & flags) == flags) {
+            bufferMemoryType = i;
+            break;
+        }
+    }
+    if (bufferMemoryType == UINT32_MAX) return;
+
+    VkMemoryAllocateInfo bufferAllocate{};
+    bufferAllocate.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+    bufferAllocate.allocationSize = bufferRequirements.size;
+    bufferAllocate.memoryTypeIndex = bufferMemoryType;
+    if (vkAllocateMemory(m_device, &bufferAllocate, nullptr, &stagingMemory) != VK_SUCCESS) return;
+    vkBindBufferMemory(m_device, staging, stagingMemory, 0);
+
+    void* mapped = nullptr;
+    vkMapMemory(m_device, stagingMemory, 0, bytes, 0, &mapped);
+    uint8_t* cursor = static_cast<uint8_t*>(mapped);
+    std::vector<VkDeviceSize> offsets(levels.size(), 0);
+    for (size_t i = 0; i < levels.size(); i++) {
+        offsets[i] = static_cast<VkDeviceSize>(cursor - static_cast<uint8_t*>(mapped));
+        std::memcpy(cursor, levels[i].data(), levels[i].size());
+        cursor += levels[i].size();
+    }
+    vkUnmapMemory(m_device, stagingMemory);
+
+    VkCommandBufferAllocateInfo allocateInfo{};
+    allocateInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+    allocateInfo.commandPool = m_commandPool;
+    allocateInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+    allocateInfo.commandBufferCount = 1;
+    VkCommandBuffer commandBuffer = VK_NULL_HANDLE;
+    vkAllocateCommandBuffers(m_device, &allocateInfo, &commandBuffer);
+
+    VkCommandBufferBeginInfo beginInfo{};
+    beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+    beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    vkBeginCommandBuffer(commandBuffer, &beginInfo);
+
+    VkImageMemoryBarrier barrier{};
+    barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+    barrier.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    barrier.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    barrier.image = image;
+    barrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    barrier.subresourceRange.levelCount = mipLevels;
+    barrier.subresourceRange.layerCount = 1;
+    barrier.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    vkCmdPipelineBarrier(commandBuffer,
+                         VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                         VK_PIPELINE_STAGE_TRANSFER_BIT,
+                         0, 0, nullptr, 0, nullptr, 1, &barrier);
+
+    for (uint32_t level = 0; level < mipLevels; level++) {
+        VkBufferImageCopy copy{};
+        copy.bufferOffset = offsets[level];
+        copy.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        copy.imageSubresource.mipLevel = level;
+        copy.imageSubresource.layerCount = 1;
+        copy.imageExtent = {std::max(1u, w >> level), std::max(1u, h >> level), 1};
+        vkCmdCopyBufferToImage(commandBuffer, staging, image,
+                               VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
+    }
+
+    barrier.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    barrier.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+    barrier.subresourceRange.baseMipLevel = 0;
+    barrier.subresourceRange.levelCount = mipLevels;
+    vkCmdPipelineBarrier(commandBuffer,
+                         VK_PIPELINE_STAGE_TRANSFER_BIT,
+                         VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR,
+                         0, 0, nullptr, 0, nullptr, 1, &barrier);
+
+    vkEndCommandBuffer(commandBuffer);
+    VkSubmitInfo submitInfo{};
+    submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+    submitInfo.commandBufferCount = 1;
+    submitInfo.pCommandBuffers = &commandBuffer;
+    vkQueueSubmit(m_queue, 1, &submitInfo, VK_NULL_HANDLE);
+    vkQueueWaitIdle(m_queue);
+    vkFreeCommandBuffers(m_device, m_commandPool, 1, &commandBuffer);
+    vkDestroyBuffer(m_device, staging, nullptr);
+    vkFreeMemory(m_device, stagingMemory, nullptr);
+
+    VkImageViewCreateInfo viewInfo{};
+    viewInfo.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+    viewInfo.image = image;
+    viewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D;
+    viewInfo.format = VK_FORMAT_R8G8B8A8_SRGB;
+    viewInfo.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    viewInfo.subresourceRange.levelCount = mipLevels;
+    viewInfo.subresourceRange.layerCount = 1;
+    if (vkCreateImageView(m_device, &viewInfo, nullptr, &view) != VK_SUCCESS) return;
+    ready = true;
+}
+
+void RayTracingPipeline::destroyImageInternal(VkImage& image, VkDeviceMemory& memory,
+                                              VkImageView& view, bool& ready) {
+    if (view != VK_NULL_HANDLE) {
+        vkDestroyImageView(m_device, view, nullptr);
+        view = VK_NULL_HANDLE;
+    }
+    if (image != VK_NULL_HANDLE) {
+        vkDestroyImage(m_device, image, nullptr);
+        image = VK_NULL_HANDLE;
+    }
+    if (memory != VK_NULL_HANDLE) {
+        vkFreeMemory(m_device, memory, nullptr);
+        memory = VK_NULL_HANDLE;
+    }
+    ready = false;
+}
+
+void RayTracingPipeline::destroyAtlas() {
+    destroyImageInternal(m_atlasImage, m_atlasMemory, m_atlasImageView, m_atlasReady);
+}
+
+void RayTracingPipeline::destroyParticleAtlas() {
+    destroyImageInternal(m_particleAtlasImage, m_particleAtlasMemory,
+                         m_particleAtlasImageView, m_particleAtlasReady);
+}
+
+void RayTracingPipeline::ensureDynamicBuffer(uint32_t count) {
+    if (count <= m_dynamicCapacity && m_dynamicBuffer != VK_NULL_HANDLE) return;
+    uint32_t capacity = std::max<uint32_t>(256, count * 2);
+    capacity = std::min<uint32_t>(capacity, MAX_DYNAMIC);
+
+    if (m_debugMapped) {
+        vkUnmapMemory(m_device, m_debugMemory);
+        m_debugMapped = nullptr;
+    }
+    if (m_debugBuffer != VK_NULL_HANDLE) {
+        vkDestroyBuffer(m_device, m_debugBuffer, nullptr);
+        m_debugBuffer = VK_NULL_HANDLE;
+    }
+    if (m_debugMemory != VK_NULL_HANDLE) {
+        vkFreeMemory(m_device, m_debugMemory, nullptr);
+        m_debugMemory = VK_NULL_HANDLE;
+    }
+
+    if (m_dynamicMapped) {
+        vkUnmapMemory(m_device, m_dynamicMemory);
+        m_dynamicMapped = nullptr;
+    }
+    if (m_dynamicBuffer != VK_NULL_HANDLE) vkDestroyBuffer(m_device, m_dynamicBuffer, nullptr);
+    if (m_dynamicMemory != VK_NULL_HANDLE) vkFreeMemory(m_device, m_dynamicMemory, nullptr);
+    m_dynamicBuffer = VK_NULL_HANDLE;
+    m_dynamicMemory = VK_NULL_HANDLE;
+
+    VkDeviceSize size = static_cast<VkDeviceSize>(capacity) * 20 * sizeof(float);
+    VkBufferCreateInfo info{};
+    info.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+    info.size = size;
+    info.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
+                 VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT |
+                 VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+    if (vkCreateBuffer(m_device, &info, nullptr, &m_dynamicBuffer) != VK_SUCCESS) return;
+
+    VkMemoryRequirements requirements{};
+    vkGetBufferMemoryRequirements(m_device, m_dynamicBuffer, &requirements);
+    VkPhysicalDeviceMemoryProperties properties{};
+    vkGetPhysicalDeviceMemoryProperties(m_physicalDevice, &properties);
+    uint32_t memoryType = UINT32_MAX;
+    VkMemoryPropertyFlags flags = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+    for (uint32_t i = 0; i < properties.memoryTypeCount; i++) {
+        if ((requirements.memoryTypeBits & (1u << i)) &&
+            (properties.memoryTypes[i].propertyFlags & flags) == flags) {
+            memoryType = i;
+            break;
+        }
+    }
+    if (memoryType == UINT32_MAX) return;
+
+    VkMemoryAllocateFlagsInfo flagsInfo{};
+    flagsInfo.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO;
+    flagsInfo.flags = VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT;
+    VkMemoryAllocateInfo allocate{};
+    allocate.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+    allocate.pNext = &flagsInfo;
+    allocate.allocationSize = requirements.size;
+    allocate.memoryTypeIndex = memoryType;
+    if (vkAllocateMemory(m_device, &allocate, nullptr, &m_dynamicMemory) != VK_SUCCESS) return;
+    vkBindBufferMemory(m_device, m_dynamicBuffer, m_dynamicMemory, 0);
+    if (vkMapMemory(m_device, m_dynamicMemory, 0, size, 0, &m_dynamicMapped) != VK_SUCCESS) return;
+    m_dynamicAddress = getBufferAddress(m_dynamicBuffer);
+    m_dynamicCapacity = capacity;
+}
+
+void RayTracingPipeline::ensureParticleBuffer(uint32_t count) {
+    if (count <= m_particleCapacity && m_particleBuffer != VK_NULL_HANDLE) return;
+    uint32_t capacity = std::max<uint32_t>(1024, count * 2);
+    capacity = std::min<uint32_t>(capacity, MAX_PARTICLES);
+
+    if (m_particleMapped) {
+        vkUnmapMemory(m_device, m_particleMemory);
+        m_particleMapped = nullptr;
+    }
+    if (m_particleBuffer != VK_NULL_HANDLE) vkDestroyBuffer(m_device, m_particleBuffer, nullptr);
+    if (m_particleMemory != VK_NULL_HANDLE) vkFreeMemory(m_device, m_particleMemory, nullptr);
+    m_particleBuffer = VK_NULL_HANDLE;
+    m_particleMemory = VK_NULL_HANDLE;
+
+    VkDeviceSize size = static_cast<VkDeviceSize>(capacity) * 8 * sizeof(float);
+    VkBufferCreateInfo info{};
+    info.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+    info.size = size;
+    info.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
+                 VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT |
+                 VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+    if (vkCreateBuffer(m_device, &info, nullptr, &m_particleBuffer) != VK_SUCCESS) return;
+
+    VkMemoryRequirements requirements{};
+    vkGetBufferMemoryRequirements(m_device, m_particleBuffer, &requirements);
+    VkPhysicalDeviceMemoryProperties properties{};
+    vkGetPhysicalDeviceMemoryProperties(m_physicalDevice, &properties);
+    uint32_t memoryType = UINT32_MAX;
+    VkMemoryPropertyFlags flags = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+    for (uint32_t i = 0; i < properties.memoryTypeCount; i++) {
+        if ((requirements.memoryTypeBits & (1u << i)) &&
+            (properties.memoryTypes[i].propertyFlags & flags) == flags) {
+            memoryType = i;
+            break;
+        }
+    }
+    if (memoryType == UINT32_MAX) return;
+
+    VkMemoryAllocateFlagsInfo flagsInfo{};
+    flagsInfo.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO;
+    flagsInfo.flags = VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT;
+    VkMemoryAllocateInfo allocate{};
+    allocate.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+    allocate.pNext = &flagsInfo;
+    allocate.allocationSize = requirements.size;
+    allocate.memoryTypeIndex = memoryType;
+    if (vkAllocateMemory(m_device, &allocate, nullptr, &m_particleMemory) != VK_SUCCESS) return;
+    vkBindBufferMemory(m_device, m_particleBuffer, m_particleMemory, 0);
+    if (vkMapMemory(m_device, m_particleMemory, 0, size, 0, &m_particleMapped) != VK_SUCCESS) return;
+    m_particleAddress = getBufferAddress(m_particleBuffer);
+    m_particleCapacity = capacity;
+}
+
+void RayTracingPipeline::uploadDynamic(const void* data, uint32_t count) {
+    if (count == 0) {
+        clearDynamic();
+        return;
+    }
+    ensureDynamicBuffer(count);
+    if (m_dynamicBuffer == VK_NULL_HANDLE || m_dynamicMapped == nullptr) return;
+    uint32_t n = std::min(count, m_dynamicCapacity);
+    std::memcpy(m_dynamicMapped, data, static_cast<size_t>(n) * 20 * sizeof(float));
+    m_dynamicCount = n;
+}
+
+void RayTracingPipeline::clearDynamic() {
+    m_dynamicCount = 0;
+}
+
+void RayTracingPipeline::uploadParticles(const void* data, uint32_t count) {
+    if (count == 0) {
+        clearParticles();
+        return;
+    }
+    ensureParticleBuffer(count);
+    if (m_particleBuffer == VK_NULL_HANDLE || m_particleMapped == nullptr) return;
+    uint32_t n = std::min(count, m_particleCapacity);
+    std::memcpy(m_particleMapped, data, static_cast<size_t>(n) * 8 * sizeof(float));
+    m_particleCount = n;
+}
+
+void RayTracingPipeline::clearParticles() {
+    m_particleCount = 0;
+}
+
+void RayTracingPipeline::uploadParticleAtlas(const void*, uint32_t, uint32_t) {
+}
+
+void RayTracingPipeline::initialize(VulkanContext& ctx, SceneAccel& scene,
+                                    VulkanOpenGLInterop& interop) {
+    m_device = ctx.getDevice();
+    m_physicalDevice = ctx.getPhysicalDevice();
+    m_queue = ctx.getQueue();
+    m_queueFamilyIndex = ctx.getQueueFamilyIndex();
+    m_scene = &scene;
+    m_interop = &interop;
+    m_skipNrd = std::getenv("YAOGUANG_NONRD") != nullptr;
+    m_skipCloud = std::getenv("YAOGUANG_NOCLOUDPASS") != nullptr;
+
+    m_vkCmdTraceRaysKHR = reinterpret_cast<PFN_vkCmdTraceRaysKHR>(
+            vkGetDeviceProcAddr(m_device, "vkCmdTraceRaysKHR"));
+    if (m_vkCmdTraceRaysKHR == nullptr) {
+        std::cerr << "[Yaoguang] vkCmdTraceRaysKHR unavailable" << std::endl;
         return;
     }
 
-    VkPipelineShaderStageCreateInfo stages[3]{};
+    VkPhysicalDeviceProperties properties{};
+    vkGetPhysicalDeviceProperties(m_physicalDevice, &properties);
+    if (properties.limits.maxPushConstantsSize < sizeof(RtPushConstants)) {
+        std::cerr << "[Yaoguang] push constant limit too small: "
+                  << properties.limits.maxPushConstantsSize << std::endl;
+        return;
+    }
+
+    std::cerr << "[FR] init: command resources" << std::endl;
+    createCommandResources();
+    createSyncObjects();
+    std::cerr << "[FR] init: descriptor layout" << std::endl;
+    createDescriptorLayout();
+    if (m_descriptorSetLayout == VK_NULL_HANDLE || m_pipelineLayout == VK_NULL_HANDLE) return;
+    createTransmittanceLut();
+    createCloudResources();
+
+    ensureDynamicBuffer(512);
+    ensureParticleBuffer(1024);
+
+    std::cerr << "[FR] init: nrd begin" << std::endl;
+    m_nrd = std::make_unique<NrdDenoiser>();
+    if (m_nrd->initialize(m_device, m_physicalDevice, m_queue, m_queueFamilyIndex, 1280, 720)) {
+        std::cout << "[Yaoguang] NRD initialized 1280x720" << std::endl;
+    } else {
+        std::cerr << "[Yaoguang] NRD initialization failed" << std::endl;
+        m_nrd.reset();
+    }
+
+    std::cerr << "[FR] init: dlss begin" << std::endl;
+    m_dlss = std::make_unique<DlssUpscaler>();
+    if (m_dlss->initialize(ctx.getInstance(), m_physicalDevice, m_device, m_queue,
+                           m_queueFamilyIndex, m_assetDir)) {
+        std::cout << "[Yaoguang] DLSS initialized" << std::endl;
+    } else {
+        std::cerr << "[Yaoguang] DLSS initialization failed: " << m_dlss->status() << std::endl;
+        m_dlss.reset();
+    }
+
+    std::cerr << "[FR] init: targets begin" << std::endl;
+    createTargets(1280, 720);
+    std::cerr << "[FR] init: targets done" << std::endl;
+    createDummyAtlas();
+    std::cerr << "[FR] init: composite" << std::endl;
+    createCompositeResources();
+    createCombineResources();
+
+    VkShaderModule raygen = loadShader(m_assetDir + "/shaders/ray_gen.rgen.spv");
+    VkShaderModule closest = loadShader(m_assetDir + "/shaders/closest_hit.rchit.spv");
+    VkShaderModule anyhit = loadShader(m_assetDir + "/shaders/alpha_test.rahit.spv");
+    VkShaderModule miss = loadShader(m_assetDir + "/shaders/miss.rmiss.spv");
+    if (raygen == VK_NULL_HANDLE || closest == VK_NULL_HANDLE || anyhit == VK_NULL_HANDLE || miss == VK_NULL_HANDLE) {
+        std::cerr << "[Yaoguang] missing ray tracing shaders" << std::endl;
+        return;
+    }
+
+    VkPipelineShaderStageCreateInfo stages[4]{};
     stages[0].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
     stages[0].stage = VK_SHADER_STAGE_RAYGEN_BIT_KHR;
-    stages[0].module = rgen;
+    stages[0].module = raygen;
     stages[0].pName = "main";
-
     stages[1].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
     stages[1].stage = VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR;
-    stages[1].module = rchit;
+    stages[1].module = closest;
     stages[1].pName = "main";
-
     stages[2].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
-    stages[2].stage = VK_SHADER_STAGE_MISS_BIT_KHR;
-    stages[2].module = rmiss;
+    stages[2].stage = VK_SHADER_STAGE_ANY_HIT_BIT_KHR;
+    stages[2].module = anyhit;
     stages[2].pName = "main";
+    stages[3].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    stages[3].stage = VK_SHADER_STAGE_MISS_BIT_KHR;
+    stages[3].module = miss;
+    stages[3].pName = "main";
 
     VkRayTracingShaderGroupCreateInfoKHR groups[3]{};
     groups[0].sType = VK_STRUCTURE_TYPE_RAY_TRACING_SHADER_GROUP_CREATE_INFO_KHR;
@@ -385,596 +1592,1503 @@ void RayTracingPipeline::initialize(VulkanContext& ctx, SceneAccel& scene,
     groups[0].closestHitShader = VK_SHADER_UNUSED_KHR;
     groups[0].anyHitShader = VK_SHADER_UNUSED_KHR;
     groups[0].intersectionShader = VK_SHADER_UNUSED_KHR;
-
     groups[1].sType = VK_STRUCTURE_TYPE_RAY_TRACING_SHADER_GROUP_CREATE_INFO_KHR;
     groups[1].type = VK_RAY_TRACING_SHADER_GROUP_TYPE_TRIANGLES_HIT_GROUP_KHR;
     groups[1].generalShader = VK_SHADER_UNUSED_KHR;
     groups[1].closestHitShader = 1;
-    groups[1].anyHitShader = VK_SHADER_UNUSED_KHR;
+    groups[1].anyHitShader = 2;
     groups[1].intersectionShader = VK_SHADER_UNUSED_KHR;
-
     groups[2].sType = VK_STRUCTURE_TYPE_RAY_TRACING_SHADER_GROUP_CREATE_INFO_KHR;
     groups[2].type = VK_RAY_TRACING_SHADER_GROUP_TYPE_GENERAL_KHR;
-    groups[2].generalShader = 2;
+    groups[2].generalShader = 3;
     groups[2].closestHitShader = VK_SHADER_UNUSED_KHR;
     groups[2].anyHitShader = VK_SHADER_UNUSED_KHR;
     groups[2].intersectionShader = VK_SHADER_UNUSED_KHR;
 
     VkRayTracingPipelineCreateInfoKHR pipelineInfo{};
     pipelineInfo.sType = VK_STRUCTURE_TYPE_RAY_TRACING_PIPELINE_CREATE_INFO_KHR;
-    pipelineInfo.stageCount = 3;
+    pipelineInfo.stageCount = 4;
     pipelineInfo.pStages = stages;
     pipelineInfo.groupCount = 3;
     pipelineInfo.pGroups = groups;
-    pipelineInfo.maxPipelineRayRecursionDepth = 4;
+    pipelineInfo.maxPipelineRayRecursionDepth = 2;
     pipelineInfo.layout = m_pipelineLayout;
 
-    auto createFn = (PFN_vkCreateRayTracingPipelinesKHR)vkGetDeviceProcAddr(m_device, "vkCreateRayTracingPipelinesKHR");
-    if (createFn) {
-        VkResult res = createFn(m_device, VK_NULL_HANDLE, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &m_pipeline);
-        if (res != VK_SUCCESS) {
-            std::cerr << "[Yaoguang] Failed to create RT pipeline: " << res << std::endl;
+    auto createFn = reinterpret_cast<PFN_vkCreateRayTracingPipelinesKHR>(
+            vkGetDeviceProcAddr(m_device, "vkCreateRayTracingPipelinesKHR"));
+    if (createFn != nullptr) {
+        VkResult result = createFn(m_device, VK_NULL_HANDLE, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &m_pipeline);
+        if (result != VK_SUCCESS) {
+            std::cerr << "[Yaoguang] failed to create RT pipeline result=" << result << std::endl;
             m_pipeline = VK_NULL_HANDLE;
-        } else {
-            std::cout << "[Yaoguang] RT pipeline created OK" << std::endl;
         }
     }
 
-    vkDestroyShaderModule(m_device, rgen, nullptr);
-    vkDestroyShaderModule(m_device, rchit, nullptr);
-    vkDestroyShaderModule(m_device, rmiss, nullptr);
+    vkDestroyShaderModule(m_device, raygen, nullptr);
+    vkDestroyShaderModule(m_device, closest, nullptr);
+    vkDestroyShaderModule(m_device, anyhit, nullptr);
+    vkDestroyShaderModule(m_device, miss, nullptr);
 
+    std::cerr << "[FR] init: sbt" << std::endl;
     buildShaderBindingTable();
     createAtlasSampler();
+
+    std::cout << "[Yaoguang] denoiser=" << (m_nrd ? "on" : "off")
+              << " dlss=" << (m_dlss && m_dlss->isAvailable() ? "on" : "off") << std::endl;
+
+    m_hasPrevCamera = false;
+    m_jitterIndex = 0;
+    std::cout << "[Yaoguang] RT pipeline initialized " << m_width << "x" << m_height << std::endl;
 }
 
 void RayTracingPipeline::buildShaderBindingTable() {
     if (m_pipeline == VK_NULL_HANDLE) return;
 
-    auto getHandlesFn = (PFN_vkGetRayTracingShaderGroupHandlesKHR)vkGetDeviceProcAddr(m_device, "vkGetRayTracingShaderGroupHandlesKHR");
-    if (!getHandlesFn) return;
+    auto getHandlesFn = reinterpret_cast<PFN_vkGetRayTracingShaderGroupHandlesKHR>(
+            vkGetDeviceProcAddr(m_device, "vkGetRayTracingShaderGroupHandlesKHR"));
+    if (getHandlesFn == nullptr) return;
 
-    VkPhysicalDeviceRayTracingPipelinePropertiesKHR rtProps{};
-    rtProps.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_TRACING_PIPELINE_PROPERTIES_KHR;
-    VkPhysicalDeviceProperties2 props2{};
-    props2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2;
-    props2.pNext = &rtProps;
-    vkGetPhysicalDeviceProperties2(m_physicalDevice, &props2);
+    VkPhysicalDeviceRayTracingPipelinePropertiesKHR rtProperties{};
+    rtProperties.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_TRACING_PIPELINE_PROPERTIES_KHR;
+    VkPhysicalDeviceProperties2 properties{};
+    properties.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2;
+    properties.pNext = &rtProperties;
+    vkGetPhysicalDeviceProperties2(m_physicalDevice, &properties);
 
-    uint32_t handleSize = rtProps.shaderGroupHandleSize;
-    uint32_t handleAlignment = rtProps.shaderGroupBaseAlignment;
-    if (handleSize == 0 || handleAlignment == 0) {
-        std::cerr << "[Yaoguang] buildShaderBindingTable: invalid RT handle size/alignment"
-                  << std::endl;
-        return;
-    }
-    uint32_t handleSizeAligned = (handleSize + handleAlignment - 1) & ~(handleAlignment - 1);
+    uint32_t handleSize = rtProperties.shaderGroupHandleSize;
+    uint32_t alignment = rtProperties.shaderGroupBaseAlignment;
+    if (handleSize == 0 || alignment == 0) return;
+    uint32_t handleSizeAligned = (handleSize + alignment - 1) & ~(alignment - 1);
 
-    uint32_t groupCount = 3;
+    const uint32_t groupCount = 3;
     std::vector<uint8_t> handles(groupCount * handleSize);
-    VkResult res = getHandlesFn(m_device, m_pipeline, 0, groupCount, groupCount * handleSize, handles.data());
-    if (res != VK_SUCCESS) return;
+    VkResult result = getHandlesFn(m_device, m_pipeline, 0, groupCount,
+                                   groupCount * handleSize, handles.data());
+    if (result != VK_SUCCESS) return;
 
-    VkDeviceSize sbtSize = (VkDeviceSize)handleSizeAligned * groupCount;
+    VkDeviceSize size = static_cast<VkDeviceSize>(handleSizeAligned) * groupCount;
+    VkBufferCreateInfo bufferInfo{};
+    bufferInfo.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+    bufferInfo.size = size;
+    bufferInfo.usage = VK_BUFFER_USAGE_SHADER_BINDING_TABLE_BIT_KHR |
+                       VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT |
+                       VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+    if (vkCreateBuffer(m_device, &bufferInfo, nullptr, &m_sbtBuffer) != VK_SUCCESS) return;
 
-    VkBufferCreateInfo bufInfo{};
-    bufInfo.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
-    bufInfo.size = sbtSize;
-    bufInfo.usage = VK_BUFFER_USAGE_SHADER_BINDING_TABLE_BIT_KHR |
-                    VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT |
-                    VK_BUFFER_USAGE_TRANSFER_DST_BIT;
-    if (vkCreateBuffer(m_device, &bufInfo, nullptr, &m_sbtBuffer) != VK_SUCCESS) return;
-
-    VkMemoryRequirements memReqs;
-    vkGetBufferMemoryRequirements(m_device, m_sbtBuffer, &memReqs);
-
-    VkPhysicalDeviceMemoryProperties memProps;
-    vkGetPhysicalDeviceMemoryProperties(m_physicalDevice, &memProps);
-
-    uint32_t memType = UINT32_MAX;
-    VkMemoryPropertyFlags wantFlags = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
-    for (uint32_t i = 0; i < memProps.memoryTypeCount; i++) {
-        if ((memReqs.memoryTypeBits & (1u << i)) &&
-            (memProps.memoryTypes[i].propertyFlags & wantFlags) == wantFlags) {
-            memType = i; break;
+    VkMemoryRequirements requirements{};
+    vkGetBufferMemoryRequirements(m_device, m_sbtBuffer, &requirements);
+    VkPhysicalDeviceMemoryProperties propertiesMemory{};
+    vkGetPhysicalDeviceMemoryProperties(m_physicalDevice, &propertiesMemory);
+    uint32_t memoryType = UINT32_MAX;
+    VkMemoryPropertyFlags flags = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+    for (uint32_t i = 0; i < propertiesMemory.memoryTypeCount; i++) {
+        if ((requirements.memoryTypeBits & (1u << i)) &&
+            (propertiesMemory.memoryTypes[i].propertyFlags & flags) == flags) {
+            memoryType = i;
+            break;
         }
     }
-    if (memType == UINT32_MAX) return;
+    if (memoryType == UINT32_MAX) return;
 
-    VkMemoryAllocateFlagsInfo allocFlags{};
-    allocFlags.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO;
-    allocFlags.flags = VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT;
-
-    VkMemoryAllocateInfo allocInfo{};
-    allocInfo.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
-    allocInfo.pNext = &allocFlags;
-    allocInfo.allocationSize = memReqs.size;
-    allocInfo.memoryTypeIndex = memType;
-    if (vkAllocateMemory(m_device, &allocInfo, nullptr, &m_sbtMemory) != VK_SUCCESS) return;
+    VkMemoryAllocateFlagsInfo flagsInfo{};
+    flagsInfo.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO;
+    flagsInfo.flags = VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT;
+    VkMemoryAllocateInfo allocate{};
+    allocate.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+    allocate.pNext = &flagsInfo;
+    allocate.allocationSize = requirements.size;
+    allocate.memoryTypeIndex = memoryType;
+    if (vkAllocateMemory(m_device, &allocate, nullptr, &m_sbtMemory) != VK_SUCCESS) return;
     vkBindBufferMemory(m_device, m_sbtBuffer, m_sbtMemory, 0);
 
     void* data = nullptr;
-    if (vkMapMemory(m_device, m_sbtMemory, 0, sbtSize, 0, &data) != VK_SUCCESS || !data) {
-        std::cerr << "[Yaoguang] buildShaderBindingTable: failed to map SBT memory" << std::endl;
+    if (vkMapMemory(m_device, m_sbtMemory, 0, size, 0, &data) != VK_SUCCESS || data == nullptr) {
         destroySBT();
         return;
     }
     for (uint32_t i = 0; i < groupCount; i++) {
-        std::memcpy((uint8_t*)data + i * handleSizeAligned, handles.data() + i * handleSize, handleSize);
+        std::memcpy(static_cast<uint8_t*>(data) + i * handleSizeAligned,
+                    handles.data() + i * handleSize, handleSize);
     }
     vkUnmapMemory(m_device, m_sbtMemory);
 
-    VkDeviceAddress sbtAddr = getBufferAddress(m_sbtBuffer);
-
-    m_sbtRayGen.deviceAddress = sbtAddr + 0 * handleSizeAligned;
+    VkDeviceAddress address = getBufferAddress(m_sbtBuffer);
+    m_sbtRayGen.deviceAddress = address;
     m_sbtRayGen.stride = handleSizeAligned;
     m_sbtRayGen.size = handleSizeAligned;
 
-    m_sbtHit.deviceAddress = sbtAddr + 1 * handleSizeAligned;
+    m_sbtHit.deviceAddress = address + handleSizeAligned;
     m_sbtHit.stride = handleSizeAligned;
     m_sbtHit.size = handleSizeAligned;
 
-    m_sbtMiss.deviceAddress = sbtAddr + 2 * handleSizeAligned;
+    m_sbtMiss.deviceAddress = address + handleSizeAligned * 2;
     m_sbtMiss.stride = handleSizeAligned;
     m_sbtMiss.size = handleSizeAligned;
 
     m_sbtCallable = {};
-    std::cout << "[Yaoguang] SBT built OK, handleSize=" << handleSize << " aligned=" << handleSizeAligned << std::endl;
 }
 
 void RayTracingPipeline::destroySBT() {
-    if (m_sbtBuffer) { vkDestroyBuffer(m_device, m_sbtBuffer, nullptr); m_sbtBuffer = VK_NULL_HANDLE; }
-    if (m_sbtMemory) { vkFreeMemory(m_device, m_sbtMemory, nullptr); m_sbtMemory = VK_NULL_HANDLE; }
-    m_sbtRayGen = {}; m_sbtMiss = {}; m_sbtHit = {}; m_sbtCallable = {};
-}
-
-void RayTracingPipeline::createAtlasSampler() {
-    if (m_atlasSampler != VK_NULL_HANDLE) return;
-    if (m_device == VK_NULL_HANDLE) return;
-    VkSamplerCreateInfo si{};
-    si.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
-    si.magFilter = VK_FILTER_LINEAR;
-    si.minFilter = VK_FILTER_LINEAR;
-    si.mipmapMode = VK_SAMPLER_MIPMAP_MODE_LINEAR;
-    si.addressModeU = VK_SAMPLER_ADDRESS_MODE_REPEAT;
-    si.addressModeV = VK_SAMPLER_ADDRESS_MODE_REPEAT;
-    si.addressModeW = VK_SAMPLER_ADDRESS_MODE_REPEAT;
-    si.maxLod = 0.0f;
-    if (vkCreateSampler(m_device, &si, nullptr, &m_atlasSampler) != VK_SUCCESS) m_atlasSampler = VK_NULL_HANDLE;
-}
-
-void RayTracingPipeline::destroyAtlas() {
-    destroyImageInternal(m_atlasImage, m_atlasMemory, m_atlasImageView, m_atlasReady);
-}
-
-void RayTracingPipeline::uploadImageInternal(
-        const void* pixels, uint32_t w, uint32_t h,
-        VkImage& image, VkDeviceMemory& memory, VkImageView& view, bool& ready) {
-
-    if (w == 0 || h == 0) return;
-
-    vkDeviceWaitIdle(m_device);
-    destroyImageInternal(image, memory, view, ready);
-
-    VkImageCreateInfo ii{};
-    ii.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
-    ii.imageType = VK_IMAGE_TYPE_2D;
-    ii.format = VK_FORMAT_R8G8B8A8_UNORM;
-    ii.extent.width = w;
-    ii.extent.height = h;
-    ii.extent.depth = 1;
-    ii.mipLevels = 1;
-    ii.arrayLayers = 1;
-    ii.samples = VK_SAMPLE_COUNT_1_BIT;
-    ii.tiling = VK_IMAGE_TILING_OPTIMAL;
-    ii.usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
-    ii.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
-    ii.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-
-    if (vkCreateImage(m_device, &ii, nullptr, &image) != VK_SUCCESS) return;
-
-    VkMemoryRequirements mr;
-    vkGetImageMemoryRequirements(m_device, image, &mr);
-
-    VkPhysicalDeviceMemoryProperties mprops;
-    vkGetPhysicalDeviceMemoryProperties(m_physicalDevice, &mprops);
-
-    uint32_t mt = UINT32_MAX;
-    for (uint32_t i = 0; i < mprops.memoryTypeCount; i++) {
-        if ((mr.memoryTypeBits & (1u << i)) &&
-            (mprops.memoryTypes[i].propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)) {
-            mt = i; break;
-        }
+    if (m_sbtBuffer != VK_NULL_HANDLE) {
+        vkDestroyBuffer(m_device, m_sbtBuffer, nullptr);
+        m_sbtBuffer = VK_NULL_HANDLE;
     }
-    if (mt == UINT32_MAX) { destroyImageInternal(image, memory, view, ready); return; }
-
-    VkMemoryAllocateInfo ma{};
-    ma.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
-    ma.allocationSize = mr.size;
-    ma.memoryTypeIndex = mt;
-    if (vkAllocateMemory(m_device, &ma, nullptr, &memory) != VK_SUCCESS) {
-        destroyImageInternal(image, memory, view, ready); return;
+    if (m_sbtMemory != VK_NULL_HANDLE) {
+        vkFreeMemory(m_device, m_sbtMemory, nullptr);
+        m_sbtMemory = VK_NULL_HANDLE;
     }
-    vkBindImageMemory(m_device, image, memory, 0);
-
-    VkDeviceSize bytes = (VkDeviceSize)w * h * 4;
-    VkBuffer staging = VK_NULL_HANDLE;
-    VkDeviceMemory stagingMem = VK_NULL_HANDLE;
-    VkBufferCreateInfo bi{};
-    bi.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
-    bi.size = bytes;
-    bi.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
-    if (vkCreateBuffer(m_device, &bi, nullptr, &staging) != VK_SUCCESS) {
-        destroyImageInternal(image, memory, view, ready); return;
-    }
-    VkMemoryRequirements bmr;
-    vkGetBufferMemoryRequirements(m_device, staging, &bmr);
-    uint32_t bmt = UINT32_MAX;
-    VkMemoryPropertyFlags hflags = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
-    for (uint32_t i = 0; i < mprops.memoryTypeCount; i++) {
-        if ((bmr.memoryTypeBits & (1u << i)) &&
-            (mprops.memoryTypes[i].propertyFlags & hflags) == hflags) {
-            bmt = i; break;
-        }
-    }
-    if (bmt == UINT32_MAX) {
-        vkDestroyBuffer(m_device, staging, nullptr);
-        destroyImageInternal(image, memory, view, ready); return;
-    }
-    VkMemoryAllocateInfo bma{};
-    bma.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
-    bma.allocationSize = bmr.size;
-    bma.memoryTypeIndex = bmt;
-    if (vkAllocateMemory(m_device, &bma, nullptr, &stagingMem) != VK_SUCCESS) {
-        vkDestroyBuffer(m_device, staging, nullptr);
-        destroyImageInternal(image, memory, view, ready); return;
-    }
-    vkBindBufferMemory(m_device, staging, stagingMem, 0);
-
-    void* mapped = nullptr;
-    vkMapMemory(m_device, stagingMem, 0, bytes, 0, &mapped);
-    std::memcpy(mapped, pixels, (size_t)bytes);
-    vkUnmapMemory(m_device, stagingMem);
-
-    VkCommandBufferAllocateInfo cba{};
-    cba.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
-    cba.commandPool = m_commandPool;
-    cba.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-    cba.commandBufferCount = 1;
-    VkCommandBuffer cmd = VK_NULL_HANDLE;
-    vkAllocateCommandBuffers(m_device, &cba, &cmd);
-
-    VkCommandBufferBeginInfo cbb{};
-    cbb.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
-    cbb.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-    vkBeginCommandBuffer(cmd, &cbb);
-
-    VkImageMemoryBarrier ib{};
-    ib.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
-    ib.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-    ib.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
-    ib.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    ib.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    ib.image = image;
-    ib.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-    ib.subresourceRange.levelCount = 1;
-    ib.subresourceRange.layerCount = 1;
-    ib.srcAccessMask = 0;
-    ib.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
-                          VK_PIPELINE_STAGE_TRANSFER_BIT,
-                          0, 0, nullptr, 0, nullptr, 1, &ib);
-
-    VkBufferImageCopy region{};
-    region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-    region.imageSubresource.layerCount = 1;
-    region.imageExtent = {w, h, 1};
-    vkCmdCopyBufferToImage(cmd, staging, image,
-                            VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
-
-    VkImageMemoryBarrier ib2 = ib;
-    ib2.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
-    ib2.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-    ib2.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-    ib2.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
-    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
-                          VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR,
-                          0, 0, nullptr, 0, nullptr, 1, &ib2);
-
-    vkEndCommandBuffer(cmd);
-
-    VkSubmitInfo si{};
-    si.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
-    si.commandBufferCount = 1;
-    si.pCommandBuffers = &cmd;
-    vkQueueSubmit(m_queue, 1, &si, VK_NULL_HANDLE);
-    vkQueueWaitIdle(m_queue);
-    vkFreeCommandBuffers(m_device, m_commandPool, 1, &cmd);
-    vkDestroyBuffer(m_device, staging, nullptr);
-    vkFreeMemory(m_device, stagingMem, nullptr);
-
-    VkImageViewCreateInfo vi{};
-    vi.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
-    vi.image = image;
-    vi.viewType = VK_IMAGE_VIEW_TYPE_2D;
-    vi.format = VK_FORMAT_R8G8B8A8_UNORM;
-    vi.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-    vi.subresourceRange.levelCount = 1;
-    vi.subresourceRange.layerCount = 1;
-    if (vkCreateImageView(m_device, &vi, nullptr, &view) != VK_SUCCESS) {
-        destroyImageInternal(image, memory, view, ready); return;
-    }
-    ready = true;
-}
-
-void RayTracingPipeline::destroyImageInternal(
-        VkImage& image, VkDeviceMemory& memory, VkImageView& view, bool& ready) {
-    if (view) { vkDestroyImageView(m_device, view, nullptr); view = VK_NULL_HANDLE; }
-    if (image) { vkDestroyImage(m_device, image, nullptr); image = VK_NULL_HANDLE; }
-    if (memory) { vkFreeMemory(m_device, memory, nullptr); memory = VK_NULL_HANDLE; }
-    ready = false;
-}
-
-void RayTracingPipeline::uploadAtlas(const void* pixels, uint32_t w, uint32_t h) {
-    uploadImageInternal(pixels, w, h,
-                        m_atlasImage, m_atlasMemory,
-                        m_atlasImageView, m_atlasReady);
-    updateDescriptorSet();
-    std::cout << "[Yaoguang] Atlas uploaded to Vulkan: " << w << "x" << h << std::endl;
+    m_sbtRayGen = {};
+    m_sbtHit = {};
+    m_sbtMiss = {};
+    m_sbtCallable = {};
 }
 
 void RayTracingPipeline::updateParams(int maxBounces, int spp, bool denoiser,
-                                       float exposure, bool pathTracing, float rayLength) {
-    m_maxBounces = maxBounces;
-    m_spp = spp;
+                                      float exposure, bool pathTracing, float rayLength) {
+    m_maxBounces = std::max(1, std::min(4, maxBounces));
+    m_spp = std::max(1, std::min(4, spp));
     m_denoiser = denoiser;
+    if (m_denoiser && m_spp > 1) {
+        if (spp != m_lastRequestedSpp) {
+            std::cout << "[Yaoguang] spp " << m_spp << " -> 1 (denoiser accumulates)" << std::endl;
+            m_lastRequestedSpp = spp;
+        }
+        m_spp = 1;
+    } else {
+        m_lastRequestedSpp = spp;
+    }
     m_exposure = exposure;
     m_pathTracing = pathTracing;
-    m_rayLength = rayLength;
+    m_rayLength = std::max(32.0f, rayLength);
+    static bool paramsLogged = false;
+    if (!paramsLogged) {
+        paramsLogged = true;
+        std::cout << "[Yaoguang] params bounces=" << m_maxBounces
+                  << " spp=" << m_spp << " denoiser=" << (m_denoiser ? "on" : "off")
+                  << " path=" << (m_pathTracing ? "on" : "off") << std::endl;
+    }
 }
 
 void RayTracingPipeline::updateCameraRaw(float px, float py, float pz,
-                                          float dx, float dy, float dz,
-                                          float ux, float uy, float uz,
-                                          float fov, float aspect) {
-    m_camPosX = px; m_camPosY = py; m_camPosZ = pz;
-    m_camDirX = dx; m_camDirY = dy; m_camDirZ = dz;
-    m_camUpX = ux; m_camUpY = uy; m_camUpZ = uz;
-    m_fov = fov; m_aspect = aspect;
+                                         float dx, float dy, float dz,
+                                         float ux, float uy, float uz,
+                                         float fov, float aspect) {
+    m_camPosX = px;
+    m_camPosY = py;
+    m_camPosZ = pz;
+    m_camDirX = dx;
+    m_camDirY = dy;
+    m_camDirZ = dz;
+    m_camUpX = ux;
+    m_camUpY = uy;
+    m_camUpZ = uz;
+    m_fov = fov;
+    m_aspect = aspect;
+}
+
+void RayTracingPipeline::setDlssQuality(int quality) {
+    if (quality < 0 || quality > 5) quality = 0;
+    m_dlssQuality = quality;
+    if (m_dlss) m_dlss->setQuality(quality);
+    m_width = 0;
+}
+
+bool RayTracingPipeline::isDlssAvailable() const {
+    return m_dlss && m_dlss->isAvailable();
+}
+
+bool RayTracingPipeline::ensureAtlasStaging(VkDeviceSize bytes) {
+    if (m_atlasStaging[0] != VK_NULL_HANDLE && m_atlasStagingSize == bytes) return true;
+    for (uint32_t i = 0; i < 2; i++) {
+        if (m_atlasStaging[i] != VK_NULL_HANDLE) vkDestroyBuffer(m_device, m_atlasStaging[i], nullptr);
+        if (m_atlasStagingMemory[i] != VK_NULL_HANDLE) vkFreeMemory(m_device, m_atlasStagingMemory[i], nullptr);
+        m_atlasStaging[i] = VK_NULL_HANDLE;
+        m_atlasStagingMemory[i] = VK_NULL_HANDLE;
+    }
+    m_atlasStagingSize = bytes;
+    for (uint32_t i = 0; i < 2; i++) {
+        VkBufferCreateInfo bufferInfo{};
+        bufferInfo.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+        bufferInfo.size = bytes;
+        bufferInfo.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
+        if (vkCreateBuffer(m_device, &bufferInfo, nullptr, &m_atlasStaging[i]) != VK_SUCCESS) return false;
+        VkMemoryRequirements requirements{};
+        vkGetBufferMemoryRequirements(m_device, m_atlasStaging[i], &requirements);
+        VkPhysicalDeviceMemoryProperties properties{};
+        vkGetPhysicalDeviceMemoryProperties(m_physicalDevice, &properties);
+        uint32_t memoryType = UINT32_MAX;
+        VkMemoryPropertyFlags flags = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+        for (uint32_t t = 0; t < properties.memoryTypeCount; t++) {
+            if ((requirements.memoryTypeBits & (1u << t)) &&
+                (properties.memoryTypes[t].propertyFlags & flags) == flags) {
+                memoryType = t;
+                break;
+            }
+        }
+        if (memoryType == UINT32_MAX) return false;
+        VkMemoryAllocateInfo allocate{};
+        allocate.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+        allocate.allocationSize = requirements.size;
+        allocate.memoryTypeIndex = memoryType;
+        if (vkAllocateMemory(m_device, &allocate, nullptr, &m_atlasStagingMemory[i]) != VK_SUCCESS) return false;
+        vkBindBufferMemory(m_device, m_atlasStaging[i], m_atlasStagingMemory[i], 0);
+    }
+    return true;
+}
+
+void RayTracingPipeline::uploadAtlasLevel0(const void* pixels, uint32_t w, uint32_t h) {
+    if (pixels == nullptr || m_atlasImage == VK_NULL_HANDLE || !m_atlasReady) return;
+    if (w != m_atlasWidth || h != m_atlasHeight) return;
+
+    VkDeviceSize bytes = static_cast<VkDeviceSize>(w) * h * 4;
+    if (!ensureAtlasStaging(bytes)) return;
+
+    uint32_t slot = m_atlasStagingIndex;
+    if (m_atlasFences[slot] == VK_NULL_HANDLE) {
+        VkFenceCreateInfo fenceInfo{};
+        fenceInfo.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
+        fenceInfo.flags = VK_FENCE_CREATE_SIGNALED_BIT;
+        if (vkCreateFence(m_device, &fenceInfo, nullptr, &m_atlasFences[slot]) != VK_SUCCESS) return;
+    }
+    if (vkGetFenceStatus(m_device, m_atlasFences[slot]) == VK_NOT_READY) return;
+    vkResetFences(m_device, 1, &m_atlasFences[slot]);
+    m_atlasStagingIndex ^= 1u;
+
+    void* mapped = nullptr;
+    if (vkMapMemory(m_device, m_atlasStagingMemory[slot], 0, bytes, 0, &mapped) != VK_SUCCESS) return;
+    std::memcpy(mapped, pixels, static_cast<size_t>(bytes));
+    vkUnmapMemory(m_device, m_atlasStagingMemory[slot]);
+
+    if (m_atlasCommands[slot] == VK_NULL_HANDLE) {
+        VkCommandBufferAllocateInfo allocateInfo{};
+        allocateInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+        allocateInfo.commandPool = m_commandPool;
+        allocateInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+        allocateInfo.commandBufferCount = 1;
+        if (vkAllocateCommandBuffers(m_device, &allocateInfo, &m_atlasCommands[slot]) != VK_SUCCESS) return;
+    }
+    VkCommandBuffer commandBuffer = m_atlasCommands[slot];
+    vkResetCommandBuffer(commandBuffer, 0);
+    VkCommandBufferBeginInfo beginInfo{};
+    beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+    beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    vkBeginCommandBuffer(commandBuffer, &beginInfo);
+
+    VkImageMemoryBarrier barrier{};
+    barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+    barrier.oldLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    barrier.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    barrier.image = m_atlasImage;
+    barrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    barrier.subresourceRange.levelCount = 1;
+    barrier.subresourceRange.layerCount = 1;
+    barrier.srcAccessMask = VK_ACCESS_SHADER_READ_BIT;
+    barrier.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    vkCmdPipelineBarrier(commandBuffer, VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR,
+                         VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &barrier);
+
+    VkBufferImageCopy copy{};
+    copy.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    copy.imageSubresource.mipLevel = 0;
+    copy.imageSubresource.layerCount = 1;
+    copy.imageExtent = {w, h, 1};
+    vkCmdCopyBufferToImage(commandBuffer, m_atlasStaging[slot], m_atlasImage,
+                           VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
+
+    barrier.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    barrier.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+    vkCmdPipelineBarrier(commandBuffer, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                         VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR, 0, 0, nullptr, 0, nullptr, 1, &barrier);
+
+    vkEndCommandBuffer(commandBuffer);
+    VkSubmitInfo submitInfo{};
+    submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+    submitInfo.commandBufferCount = 1;
+    submitInfo.pCommandBuffers = &commandBuffer;
+    vkQueueSubmit(m_queue, 1, &submitInfo, m_atlasFences[slot]);
+}
+
+void RayTracingPipeline::uploadAtlas(const void* pixels, uint32_t w, uint32_t h) {
+    uploadImageInternal(pixels, w, h, m_atlasImage, m_atlasMemory, m_atlasImageView, m_atlasReady);
+    if (m_atlasReady) {
+        m_atlasWidth = w;
+        m_atlasHeight = h;
+        m_atlasMipLevels = 1;
+        uint32_t maxDimension = w > h ? w : h;
+        while (m_atlasMipLevels < 4 && (maxDimension >> m_atlasMipLevels) > 0) {
+            m_atlasMipLevels++;
+        }
+        updateDescriptorSet();
+    }
+}
+
+void RayTracingPipeline::recreateDescriptorSet() {
+    if (m_descriptorPool == VK_NULL_HANDLE || m_descriptorSetLayout == VK_NULL_HANDLE) return;
+    vkResetDescriptorPool(m_device, m_descriptorPool, 0);
+    m_descriptorSet = VK_NULL_HANDLE;
+    VkDescriptorSetAllocateInfo allocateInfo{};
+    allocateInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+    allocateInfo.descriptorPool = m_descriptorPool;
+    allocateInfo.descriptorSetCount = 1;
+    allocateInfo.pSetLayouts = &m_descriptorSetLayout;
+    if (vkAllocateDescriptorSets(m_device, &allocateInfo, &m_descriptorSet) != VK_SUCCESS) {
+        std::cerr << "[Yaoguang] descriptor set reallocation failed" << std::endl;
+        m_descriptorSet = VK_NULL_HANDLE;
+    }
 }
 
 void RayTracingPipeline::updateDescriptorSet() {
-    if (!m_scene || !m_interop) return;
-    if (m_descriptorSet == VK_NULL_HANDLE) return;
-    if (m_scene->getTLAS() == VK_NULL_HANDLE) return;
-    if (m_interop->getVulkanImageView() == VK_NULL_HANDLE) return;
+    static int updateCount = 0;
+    bool traceUpdate = updateCount < 3;
+    if (traceUpdate) {
+        updateCount++;
+        std::cout << "[DS] begin update" << std::endl;
+    }
+    if (m_scene == nullptr) return;
+    if (m_scene->getTLAS() == VK_NULL_HANDLE || m_scene->getVertexBuffer() == VK_NULL_HANDLE) return;
+    if (m_diffuse.view == VK_NULL_HANDLE) return;
 
-    VkDescriptorImageInfo imageInfo{};
-    imageInfo.imageView = m_interop->getVulkanImageView();
-    imageInfo.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+    VkDescriptorImageInfo diffuseInfo{};
+    diffuseInfo.imageView = m_diffuse.view;
+    diffuseInfo.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+    VkDescriptorImageInfo specularInfo{};
+    specularInfo.imageView = m_specular.view;
+    specularInfo.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+    VkDescriptorImageInfo normalInfo{};
+    normalInfo.imageView = m_normalRough.view;
+    normalInfo.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+    VkDescriptorImageInfo viewZInfo{};
+    viewZInfo.imageView = m_viewZ.view;
+    viewZInfo.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+    VkDescriptorImageInfo motionInfo{};
+    motionInfo.imageView = m_motion.view;
+    motionInfo.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
 
-    VkWriteDescriptorSetAccelerationStructureKHR asInfo{};
-    asInfo.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET_ACCELERATION_STRUCTURE_KHR;
-    asInfo.accelerationStructureCount = 1;
+    VkDescriptorImageInfo atlasInfo{};
+    atlasInfo.imageView = m_atlasReady ? m_atlasImageView : m_dummyAtlasView;
+    atlasInfo.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    atlasInfo.sampler = m_atlasSampler ? m_atlasSampler : m_compositeSampler;
+
+    VkDescriptorImageInfo lutInfo{};
+    lutInfo.imageView = m_transmittanceLutView;
+    lutInfo.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    lutInfo.sampler = m_transmittanceLutSampler;
+
+    VkDescriptorImageInfo cloudInfo{};
+    cloudInfo.imageView = m_cloudView[m_cloudWriteIndex];
+    cloudInfo.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+    cloudInfo.sampler = m_cloudSampler;
+
+    VkWriteDescriptorSetAccelerationStructureKHR accelerationInfo{};
+    accelerationInfo.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET_ACCELERATION_STRUCTURE_KHR;
+    accelerationInfo.accelerationStructureCount = 1;
     VkAccelerationStructureKHR tlas = m_scene->getTLAS();
-    asInfo.pAccelerationStructures = &tlas;
+    accelerationInfo.pAccelerationStructures = &tlas;
 
     VkDescriptorBufferInfo vertexInfo{};
     vertexInfo.buffer = m_scene->getVertexBuffer();
-    vertexInfo.offset = 0;
     vertexInfo.range = VK_WHOLE_SIZE;
-
     VkDescriptorBufferInfo indexInfo{};
     indexInfo.buffer = m_scene->getIndexBuffer();
-    indexInfo.offset = 0;
     indexInfo.range = VK_WHOLE_SIZE;
+    VkDescriptorBufferInfo dynamicInfo{};
+    dynamicInfo.buffer = m_dynamicBuffer;
+    dynamicInfo.range = VK_WHOLE_SIZE;
+    VkDescriptorBufferInfo particleInfo{};
+    particleInfo.buffer = m_particleBuffer;
+    particleInfo.range = VK_WHOLE_SIZE;
 
-    VkBuffer safeDyn = m_dynamicBuffer;
-    if (safeDyn == VK_NULL_HANDLE) safeDyn = m_scene->getIndexBuffer();
-    if (safeDyn == VK_NULL_HANDLE) return;
+    if (atlasInfo.imageView == VK_NULL_HANDLE || atlasInfo.sampler == VK_NULL_HANDLE) return;
+    if (dynamicInfo.buffer == VK_NULL_HANDLE || particleInfo.buffer == VK_NULL_HANDLE) return;
+    if (m_descriptorSet == VK_NULL_HANDLE) return;
+    if (m_cloudView[0] == VK_NULL_HANDLE || m_cloudSampler == VK_NULL_HANDLE) return;
+    if (vertexInfo.buffer == VK_NULL_HANDLE || indexInfo.buffer == VK_NULL_HANDLE) return;
+    if (tlas == VK_NULL_HANDLE) return;
 
-    VkDescriptorBufferInfo dynInfo{};
-    dynInfo.buffer = safeDyn;
-    dynInfo.offset = 0;
-    dynInfo.range = VK_WHOLE_SIZE;
+    VkDescriptorImageInfo* images[14] = {};
+    images[0] = &diffuseInfo;
+    images[7] = &specularInfo;
+    images[8] = &normalInfo;
+    images[9] = &viewZInfo;
+    images[10] = &motionInfo;
+    images[12] = &lutInfo;
+    images[13] = &cloudInfo;
 
-    VkBuffer safePart = m_particleBuffer;
-    if (safePart == VK_NULL_HANDLE) safePart = m_scene->getIndexBuffer();
-    if (safePart == VK_NULL_HANDLE) return;
+    VkDescriptorBufferInfo chunkTableInfo{};
+    chunkTableInfo.buffer = m_scene->getChunkTableBuffer();
+    chunkTableInfo.offset = 0;
+    chunkTableInfo.range = VK_WHOLE_SIZE;
 
-    VkDescriptorBufferInfo partInfo{};
-    partInfo.buffer = safePart;
-    partInfo.offset = 0;
-    partInfo.range = VK_WHOLE_SIZE;
+    VkDescriptorBufferInfo* buffers[14] = {};
+    buffers[2] = &vertexInfo;
+    buffers[3] = &indexInfo;
+    buffers[5] = &dynamicInfo;
+    buffers[6] = &particleInfo;
+    buffers[11] = &chunkTableInfo;
 
-    VkImageView safeAtlasView = m_atlasImageView;
-    if (safeAtlasView == VK_NULL_HANDLE) safeAtlasView = m_interop->getVulkanImageView();
+    VkWriteDescriptorSet writes[14]{};
+    uint32_t count = 0;
+    for (uint32_t binding = 0; binding < 14; binding++) {
+        writes[count].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        writes[count].dstSet = m_descriptorSet;
+        writes[count].dstBinding = binding;
+        writes[count].descriptorCount = 1;
+        if (binding == 0 || (binding >= 7 && binding <= 10)) {
+            writes[count].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+            writes[count].pImageInfo = images[binding];
+        } else if (binding == 1) {
+            writes[count].pNext = &accelerationInfo;
+            writes[count].descriptorType = VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR;
+        } else if (binding == 4) {
+            writes[count].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+            writes[count].pImageInfo = &atlasInfo;
+        } else if (binding == 12 || binding == 13) {
+            writes[count].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+            writes[count].pImageInfo = images[binding];
+        } else {
+            writes[count].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+            writes[count].pBufferInfo = buffers[binding];
+        }
+        count++;
+    }
 
-    if (m_atlasSampler == VK_NULL_HANDLE) createAtlasSampler();
-    if (m_atlasSampler == VK_NULL_HANDLE) return;
+    if (traceUpdate) {
+        std::cout << "[DS] set=" << (void*)m_descriptorSet
+                  << " diffuse=" << (void*)m_diffuse.view
+                  << " spec=" << (void*)m_specular.view
+                  << " nr=" << (void*)m_normalRough.view
+                  << " viewz=" << (void*)m_viewZ.view
+                  << " motion=" << (void*)m_motion.view
+                  << " atlas=" << (void*)atlasInfo.imageView
+                  << " sampler=" << (void*)atlasInfo.sampler
+                  << " dyn=" << (void*)m_dynamicBuffer
+                  << " part=" << (void*)m_particleBuffer
+                  << " vb=" << (void*)vertexInfo.buffer
+                  << " ib=" << (void*)indexInfo.buffer
+                  << " tlas=" << (void*)tlas << std::endl;
+    }
+    vkUpdateDescriptorSets(m_device, count, writes, 0, nullptr);
+    if (traceUpdate) std::cout << "[DS] written" << std::endl;
+}
 
-    VkDescriptorImageInfo atlasInfo{};
-    atlasInfo.imageView = safeAtlasView;
-    atlasInfo.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-    atlasInfo.sampler = m_atlasSampler;
+void RayTracingPipeline::updateCombineDescriptorSet(bool denoised) {
+    if (m_combineSet == VK_NULL_HANDLE || m_hdr.view == VK_NULL_HANDLE || m_depth.view == VK_NULL_HANDLE) return;
+    if (m_diffuse.view == VK_NULL_HANDLE || m_specular.view == VK_NULL_HANDLE || m_viewZ.view == VK_NULL_HANDLE) return;
 
-    VkWriteDescriptorSet writes[7]{};
-    uint32_t wc = 0;
+    VkImageView diffuseView = m_diffuse.view;
+    VkImageView specularView = m_specular.view;
+    if (denoised && m_nrd && m_nrd->isInitialized()) {
+        if (m_nrd->getDiffuseView() != VK_NULL_HANDLE) diffuseView = m_nrd->getDiffuseView();
+        if (m_nrd->getSpecularView() != VK_NULL_HANDLE) specularView = m_nrd->getSpecularView();
+    }
 
-    writes[wc].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-    writes[wc].dstSet = m_descriptorSet;
-    writes[wc].dstBinding = 0;
-    writes[wc].descriptorCount = 1;
-    writes[wc].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
-    writes[wc].pImageInfo = &imageInfo;
-    wc++;
+    VkDescriptorImageInfo diffuseInfo{};
+    diffuseInfo.imageView = diffuseView;
+    diffuseInfo.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+    diffuseInfo.sampler = m_compositeSampler;
+    VkDescriptorImageInfo specularInfo{};
+    specularInfo.imageView = specularView;
+    specularInfo.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+    specularInfo.sampler = m_compositeSampler;
+    VkDescriptorImageInfo viewZInfo{};
+    viewZInfo.imageView = m_viewZ.view;
+    viewZInfo.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+    viewZInfo.sampler = m_compositeSampler;
 
-    writes[wc].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-    writes[wc].pNext = &asInfo;
-    writes[wc].dstSet = m_descriptorSet;
-    writes[wc].dstBinding = 1;
-    writes[wc].descriptorCount = 1;
-    writes[wc].descriptorType = VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR;
-    wc++;
+    VkDescriptorImageInfo hdrInfo{};
+    hdrInfo.imageView = m_hdr.view;
+    hdrInfo.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+    VkDescriptorImageInfo depthInfo{};
+    depthInfo.imageView = m_depth.view;
+    depthInfo.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
 
-    writes[wc].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-    writes[wc].dstSet = m_descriptorSet;
-    writes[wc].dstBinding = 2;
-    writes[wc].descriptorCount = 1;
-    writes[wc].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-    writes[wc].pBufferInfo = &vertexInfo;
-    wc++;
+    VkWriteDescriptorSet writes[5]{};
+    VkDescriptorImageInfo* sources[3] = {&diffuseInfo, &specularInfo, &viewZInfo};
+    for (uint32_t i = 0; i < 3; i++) {
+        writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        writes[i].dstSet = m_combineSet;
+        writes[i].dstBinding = i;
+        writes[i].descriptorCount = 1;
+        writes[i].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        writes[i].pImageInfo = sources[i];
+    }
+    writes[3].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+    writes[3].dstSet = m_combineSet;
+    writes[3].dstBinding = 3;
+    writes[3].descriptorCount = 1;
+    writes[3].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+    writes[3].pImageInfo = &hdrInfo;
+    writes[4].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+    writes[4].dstSet = m_combineSet;
+    writes[4].dstBinding = 4;
+    writes[4].descriptorCount = 1;
+    writes[4].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+    writes[4].pImageInfo = &depthInfo;
+    vkUpdateDescriptorSets(m_device, 5, writes, 0, nullptr);
+}
 
-    writes[wc].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-    writes[wc].dstSet = m_descriptorSet;
-    writes[wc].dstBinding = 3;
-    writes[wc].descriptorCount = 1;
-    writes[wc].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-    writes[wc].pBufferInfo = &indexInfo;
-    wc++;
+void RayTracingPipeline::updateCompositeDescriptorSet(VkImageView source, uint32_t sourceWidth,
+                                                       uint32_t sourceHeight, bool upscale) {
+    (void)sourceWidth;
+    (void)sourceHeight;
+    (void)upscale;
+    if (m_compositeSet == VK_NULL_HANDLE || m_interop == nullptr) return;
+    if (source == VK_NULL_HANDLE) return;
+    VkImageView destination = m_interop->getVulkanImageView();
+    if (destination == VK_NULL_HANDLE) return;
+    if (m_motion.view == VK_NULL_HANDLE) return;
+    Target& historyIn = m_taaHistory[m_taaIndex ^ 1u];
+    Target& historyOut = m_taaHistory[m_taaIndex];
+    if (historyIn.view == VK_NULL_HANDLE || historyOut.view == VK_NULL_HANDLE) return;
 
-    writes[wc].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-    writes[wc].dstSet = m_descriptorSet;
-    writes[wc].dstBinding = 4;
-    writes[wc].descriptorCount = 1;
-    writes[wc].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-    writes[wc].pImageInfo = &atlasInfo;
-    wc++;
+    VkDescriptorImageInfo sourceInfo{};
+    sourceInfo.imageView = source;
+    sourceInfo.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+    sourceInfo.sampler = m_compositeSampler;
 
-    writes[wc].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-    writes[wc].dstSet = m_descriptorSet;
-    writes[wc].dstBinding = 5;
-    writes[wc].descriptorCount = 1;
-    writes[wc].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-    writes[wc].pBufferInfo = &dynInfo;
-    wc++;
+    VkDescriptorImageInfo destinationInfo{};
+    destinationInfo.imageView = destination;
+    destinationInfo.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
 
-    writes[wc].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-    writes[wc].dstSet = m_descriptorSet;
-    writes[wc].dstBinding = 6;
-    writes[wc].descriptorCount = 1;
-    writes[wc].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-    writes[wc].pBufferInfo = &partInfo;
-    wc++;
+    VkDescriptorImageInfo historyInfo{};
+    historyInfo.imageView = historyIn.view;
+    historyInfo.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+    historyInfo.sampler = m_compositeSampler;
 
-    vkUpdateDescriptorSets(m_device, wc, writes, 0, nullptr);
+    VkDescriptorImageInfo motionInfo{};
+    motionInfo.imageView = m_motion.view;
+    motionInfo.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+    motionInfo.sampler = m_compositeSampler;
+
+    VkDescriptorImageInfo historyOutInfo{};
+    historyOutInfo.imageView = historyOut.view;
+    historyOutInfo.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+
+    VkDescriptorImageInfo depthInfo{};
+    depthInfo.imageView = m_depth.view;
+    depthInfo.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+    depthInfo.sampler = m_compositeSampler;
+
+    VkWriteDescriptorSet writes[6]{};
+    for (uint32_t i = 0; i < 6; i++) {
+        writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        writes[i].dstSet = m_compositeSet;
+        writes[i].dstBinding = i;
+        writes[i].descriptorCount = 1;
+    }
+    writes[0].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    writes[0].pImageInfo = &sourceInfo;
+    writes[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+    writes[1].pImageInfo = &destinationInfo;
+    writes[2].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    writes[2].pImageInfo = &historyInfo;
+    writes[3].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    writes[3].pImageInfo = &motionInfo;
+    writes[4].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+    writes[4].pImageInfo = &historyOutInfo;
+    writes[5].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    writes[5].pImageInfo = &depthInfo;
+    vkUpdateDescriptorSets(m_device, 6, writes, 0, nullptr);
+}
+
+float RayTracingPipeline::dlssRatio() const {
+    if (m_dlssQuality == 5) return 1.0f;
+    if (m_dlssQuality == 1) return 2.0f / 3.0f;
+    if (m_dlssQuality == 2) return 0.581f;
+    if (m_dlssQuality == 3) return 0.5f;
+    if (m_dlssQuality == 4) return 1.0f / 3.0f;
+    return 2.0f / 3.0f;
+}
+
+namespace {
+float halfToFloatBits(uint16_t h) {
+    uint32_t sign = (h >> 15) & 0x1u;
+    uint32_t exponent = (h >> 10) & 0x1Fu;
+    uint32_t mantissa = h & 0x3FFu;
+    uint32_t bits;
+    if (exponent == 0) {
+        bits = sign << 31;
+    } else if (exponent == 31) {
+        bits = (sign << 31) | 0x7F800000u;
+    } else {
+        bits = (sign << 31) | ((exponent + 112) << 23) | (mantissa << 13);
+    }
+    float value;
+    std::memcpy(&value, &bits, sizeof(value));
+    return value;
+}
+}
+
+bool RayTracingPipeline::createDebugBuffer() {
+    if (m_debugBuffer != VK_NULL_HANDLE) return true;
+    VkDeviceSize bytes = 64ull * 36ull * 8ull;
+    VkBufferCreateInfo info{};
+    info.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+    info.size = bytes;
+    info.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+    if (vkCreateBuffer(m_device, &info, nullptr, &m_debugBuffer) != VK_SUCCESS) return false;
+    VkMemoryRequirements requirements{};
+    vkGetBufferMemoryRequirements(m_device, m_debugBuffer, &requirements);
+    VkPhysicalDeviceMemoryProperties properties{};
+    vkGetPhysicalDeviceMemoryProperties(m_physicalDevice, &properties);
+    uint32_t type = UINT32_MAX;
+    for (uint32_t i = 0; i < properties.memoryTypeCount; i++) {
+        if ((requirements.memoryTypeBits & (1u << i)) &&
+            (properties.memoryTypes[i].propertyFlags & (VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)) ==
+            (VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)) {
+            type = i;
+            break;
+        }
+    }
+    if (type == UINT32_MAX) return false;
+    VkMemoryAllocateInfo allocate{};
+    allocate.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+    allocate.allocationSize = requirements.size;
+    allocate.memoryTypeIndex = type;
+    if (vkAllocateMemory(m_device, &allocate, nullptr, &m_debugMemory) != VK_SUCCESS) return false;
+    if (vkBindBufferMemory(m_device, m_debugBuffer, m_debugMemory, 0) != VK_SUCCESS) return false;
+    if (vkMapMemory(m_device, m_debugMemory, 0, bytes, 0, &m_debugMapped) != VK_SUCCESS) return false;
+    return true;
+}
+
+bool RayTracingPipeline::ensureCaptureBuffer(uint32_t width, uint32_t height) {
+    if (m_captureBuffer != VK_NULL_HANDLE && m_captureWidth == width && m_captureHeight == height) return true;
+    if (m_captureMapped != nullptr) {
+        vkUnmapMemory(m_device, m_captureMemory);
+        m_captureMapped = nullptr;
+    }
+    if (m_captureBuffer != VK_NULL_HANDLE) {
+        vkDestroyBuffer(m_device, m_captureBuffer, nullptr);
+        m_captureBuffer = VK_NULL_HANDLE;
+    }
+    if (m_captureMemory != VK_NULL_HANDLE) {
+        vkFreeMemory(m_device, m_captureMemory, nullptr);
+        m_captureMemory = VK_NULL_HANDLE;
+    }
+    VkDeviceSize bytes = static_cast<VkDeviceSize>(width) * height * 8ull;
+    VkBufferCreateInfo info{};
+    info.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+    info.size = bytes;
+    info.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+    if (vkCreateBuffer(m_device, &info, nullptr, &m_captureBuffer) != VK_SUCCESS) return false;
+    VkMemoryRequirements requirements{};
+    vkGetBufferMemoryRequirements(m_device, m_captureBuffer, &requirements);
+    VkPhysicalDeviceMemoryProperties properties{};
+    vkGetPhysicalDeviceMemoryProperties(m_physicalDevice, &properties);
+    uint32_t type = UINT32_MAX;
+    for (uint32_t i = 0; i < properties.memoryTypeCount; i++) {
+        if ((requirements.memoryTypeBits & (1u << i)) &&
+            (properties.memoryTypes[i].propertyFlags & (VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)) ==
+            (VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)) {
+            type = i;
+            break;
+        }
+    }
+    if (type == UINT32_MAX) return false;
+    VkMemoryAllocateInfo allocate{};
+    allocate.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+    allocate.allocationSize = requirements.size;
+    allocate.memoryTypeIndex = type;
+    if (vkAllocateMemory(m_device, &allocate, nullptr, &m_captureMemory) != VK_SUCCESS) return false;
+    if (vkBindBufferMemory(m_device, m_captureBuffer, m_captureMemory, 0) != VK_SUCCESS) return false;
+    if (vkMapMemory(m_device, m_captureMemory, 0, bytes, 0, &m_captureMapped) != VK_SUCCESS) return false;
+    m_captureWidth = width;
+    m_captureHeight = height;
+    return true;
+}
+
+void RayTracingPipeline::writeCaptureToPpm(const char* path) {
+    if (m_captureMapped == nullptr || m_captureWidth == 0) return;
+    FILE* file = std::fopen(path, "wb");
+    if (file == nullptr) return;
+    std::fprintf(file, "P6\n%u %u\n255\n", m_captureWidth, m_captureHeight);
+    const uint16_t* halves = static_cast<const uint16_t*>(m_captureMapped);
+    std::vector<unsigned char> row(static_cast<size_t>(m_captureWidth) * 3u);
+    for (uint32_t y = 0; y < m_captureHeight; y++) {
+        for (uint32_t x = 0; x < m_captureWidth; x++) {
+            size_t index = (static_cast<size_t>(y) * m_captureWidth + x) * 4u;
+            for (uint32_t c = 0; c < 3u; c++) {
+                float value = halfToFloatBits(halves[index + c]);
+                if (!(value == value)) value = 0.0f;
+                value *= m_exposure;
+                value = (value * (2.51f * value + 0.03f)) / (value * (2.43f * value + 0.59f) + 0.14f);
+                if (value < 0.0f) value = 0.0f;
+                if (value > 1.0f) value = 1.0f;
+                value = std::pow(value, 1.0f / 2.2f);
+                row[x * 3u + c] = static_cast<unsigned char>(value * 255.0f + 0.5f);
+            }
+        }
+        std::fwrite(row.data(), 1, row.size(), file);
+    }
+    std::fclose(file);
+    std::cout << "[Yaoguang] capture written " << path << " " << m_captureWidth << "x" << m_captureHeight << std::endl;
+}
+
+float RayTracingPipeline::debugBufferMean() {
+    if (m_debugMapped == nullptr) return 0.0f;
+    const uint16_t* halves = static_cast<const uint16_t*>(m_debugMapped);
+    double sum = 0.0;
+    for (uint32_t i = 0; i < 64u * 36u; i++) {
+        for (uint32_t c = 0; c < 3u; c++) {
+            float value = halfToFloatBits(halves[i * 4u + c]);
+            if (!(value == value)) continue;
+            sum += value;
+        }
+    }
+    return static_cast<float>(sum / (64.0 * 36.0 * 3.0));
+}
+
+void RayTracingPipeline::reportFrameStats() {
+    if (m_debugMapped == nullptr) return;
+    const uint16_t* halves = static_cast<const uint16_t*>(m_debugMapped);
+    double sum = 0.0;
+    float maxValue = 0.0f;
+    for (uint32_t i = 0; i < 64u * 36u; i++) {
+        for (uint32_t c = 0; c < 3u; c++) {
+            float value = halfToFloatBits(halves[i * 4u + c]);
+            if (!(value == value)) continue;
+            sum += value;
+            if (value > maxValue) maxValue = value;
+        }
+    }
+    std::cout << "[Yaoguang] frame " << m_frameIndex << " render=" << m_width << "x" << m_height
+              << " output=" << m_outputWidth << "x" << m_outputHeight
+              << " hdrMean=" << (sum / (64.0 * 36.0 * 3.0))
+              << " hdrMax=" << maxValue
+              << " dlss=" << ((m_dlss && m_dlss->isAvailable()) ? 1 : 0)
+              << " sunY=" << m_sunDirY << " sunI=" << m_sunIntensity
+              << " wet=" << m_wetness << " bounces=" << m_maxBounces
+              << " spp=" << m_spp << " time=" << m_time << " verts=" << m_scene->getVertexCount() << std::endl;
+}
+
+namespace {
+float halton(uint32_t index, uint32_t base) {
+    float result = 0.0f;
+    float fraction = 1.0f;
+    uint32_t i = index;
+    while (i > 0) {
+        fraction /= static_cast<float>(base);
+        result += fraction * static_cast<float>(i % base);
+        i /= base;
+    }
+    return result;
+}
 }
 
 void RayTracingPipeline::renderFrame() {
-    if (!m_pipeline || !m_scene || !m_interop) return;
-    if (m_sbtRayGen.size == 0) return;
-    if (m_commandBuffer == VK_NULL_HANDLE) return;
+    static int enterCount = 0;
+    if (enterCount < 5) {
+        enterCount++;
+        std::cout << "[FR] enter pipeline=" << (m_pipeline != VK_NULL_HANDLE)
+                  << " composite=" << (m_compositePipeline != VK_NULL_HANDLE)
+                  << " combine=" << (m_combinePipeline != VK_NULL_HANDLE)
+                  << " scene=" << (m_scene != nullptr && m_scene->isValid())
+                  << " interop=" << (m_interop != nullptr)
+                  << " timedout=" << m_frameTimedOut << std::endl;
+    }
+    if (m_deviceLost) {
+        return;
+    }
+    if (m_frameTimedOut) {
+        VkResult recover = vkWaitForFences(m_device, 1, &m_fence, VK_TRUE, 5000000000ULL);
+        if (recover == VK_SUCCESS) {
+            m_frameTimedOut = false;
+            m_fenceTimeouts = 0;
+        } else if (recover == VK_TIMEOUT) {
+            vkDeviceWaitIdle(m_device);
+            if (vkGetFenceStatus(m_device, m_fence) != VK_SUCCESS) {
+                vkResetFences(m_device, 1, &m_fence);
+            }
+            m_frameTimedOut = false;
+            m_fenceTimeouts = 0;
+            std::cerr << "[Yaoguang] frame recovered after fence timeout" << std::endl;
+        } else {
+            if (!m_deviceLost) {
+                std::cerr << "[Yaoguang] GPU device lost during frame recovery: " << recover << std::endl;
+            }
+            m_deviceLost = true;
+            return;
+        }
+    }
+    if (m_pipeline == VK_NULL_HANDLE || m_compositePipeline == VK_NULL_HANDLE) return;
+    if (m_combinePipeline == VK_NULL_HANDLE) return;
+    if (m_scene == nullptr || m_interop == nullptr) return;
+    if (m_sbtRayGen.size == 0 || m_commandBuffer == VK_NULL_HANDLE) return;
     if (!m_scene->isValid()) return;
 
-    VkImage outImage = m_interop->getVulkanImage();
-    VkImageView outView = m_interop->getVulkanImageView();
-    if (outImage == VK_NULL_HANDLE || outView == VK_NULL_HANDLE) return;
+    uint32_t outputWidth = m_interop->getWidth();
+    uint32_t outputHeight = m_interop->getHeight();
+    if (outputWidth == 0 || outputHeight == 0) return;
 
-    uint32_t w = m_interop->getWidth();
-    uint32_t h = m_interop->getHeight();
-    if (w == 0 || h == 0) return;
+    bool dlssActive = m_dlss && m_dlss->isAvailable();
+    float scale = dlssActive ? dlssRatio() : m_renderScale;
+    uint32_t width = static_cast<uint32_t>(outputWidth * scale);
+    uint32_t height = static_cast<uint32_t>(outputHeight * scale);
+    if (width < 64) width = 64;
+    if (height < 64) height = 64;
+    if (width > outputWidth) width = outputWidth;
+    if (height > outputHeight) height = outputHeight;
 
-    vkWaitForFences(m_device, 1, &m_fence, VK_TRUE, UINT64_MAX);
+    VkResult priorWait = vkWaitForFences(m_device, 1, &m_fence, VK_TRUE, 5000000000ULL);
+    if (priorWait != VK_SUCCESS) {
+        std::cerr << "[Yaoguang] previous frame fence wait failed: " << priorWait << std::endl;
+        if (priorWait == VK_TIMEOUT) {
+            if (++m_fenceTimeouts >= 3) {
+                m_frameTimedOut = true;
+                m_fenceTimeouts = 0;
+            }
+        } else {
+            if (!m_deviceLost) {
+                std::cerr << "[Yaoguang] GPU device lost (frame fence): " << priorWait << std::endl;
+            }
+            m_deviceLost = true;
+        }
+        return;
+    }
+    m_fenceTimeouts = 0;
+    if (m_frameIndex < 3) std::cout << "[FR] begin frame " << m_frameIndex << " " << width << "x" << height << std::endl;
+    if (!createTargets(width, height)) return;
+    if (m_frameIndex < 3) std::cout << "[FR] targets ready" << std::endl;
+    bool probeThisFrame = m_frameIndex == 0;
+    bool wantStats = (m_frameIndex == 60) || (m_frameIndex > 0 && m_frameIndex % 240 == 0);
+    bool wantDlssCheck = m_frameIndex == 2 && m_dlss && m_dlss->isAvailable();
+    bool captureThisFrame = (m_frameIndex == 60 || m_frameIndex == 900);
+    if (probeThisFrame || wantStats || wantDlssCheck) {
+        if (!createDebugBuffer()) {
+            wantStats = false;
+            wantDlssCheck = false;
+        }
+    }
+    if (m_frameIndex < 3) std::cout << "[FR] debug buffer ready" << std::endl;
     vkResetFences(m_device, 1, &m_fence);
     vkResetCommandBuffer(m_commandBuffer, 0);
+    if (m_frameIndex < 3) std::cout << "[FR] fence reset" << std::endl;
+
+    updateDescriptorSet();
+    if (m_frameIndex < 3) std::cout << "[FR] descriptors ready" << std::endl;
 
     VkCommandBufferBeginInfo beginInfo{};
     beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
     beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
     if (vkBeginCommandBuffer(m_commandBuffer, &beginInfo) != VK_SUCCESS) return;
 
-    updateDescriptorSet();
+    barrierToGeneral(m_commandBuffer, m_diffuse);
+    barrierToGeneral(m_commandBuffer, m_specular);
+    barrierToGeneral(m_commandBuffer, m_normalRough);
+    barrierToGeneral(m_commandBuffer, m_viewZ);
+    barrierToGeneral(m_commandBuffer, m_motion);
 
-    VkImageLayout oldLayout = (outImage == m_lastBoundImage)
-                              ? VK_IMAGE_LAYOUT_GENERAL
-                              : VK_IMAGE_LAYOUT_UNDEFINED;
-    m_lastBoundImage = outImage;
+    VkImage sharedImage = m_interop->getVulkanImage();
+    if (sharedImage != VK_NULL_HANDLE) {
+        VkImageMemoryBarrier barrier{};
+        barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+        barrier.oldLayout = sharedImage == m_boundSharedImage
+                ? m_boundSharedLayout : VK_IMAGE_LAYOUT_UNDEFINED;
+        barrier.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+        barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        barrier.image = sharedImage;
+        barrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        barrier.subresourceRange.levelCount = 1;
+        barrier.subresourceRange.layerCount = 1;
+        barrier.srcAccessMask = 0;
+        barrier.dstAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+        vkCmdPipelineBarrier(m_commandBuffer,
+                             VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                             VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                             0, 0, nullptr, 0, nullptr, 1, &barrier);
+        m_boundSharedImage = sharedImage;
+        m_boundSharedLayout = VK_IMAGE_LAYOUT_GENERAL;
+    }
 
-    VkImageMemoryBarrier initialBarrier{};
-    initialBarrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
-    initialBarrier.oldLayout = oldLayout;
-    initialBarrier.newLayout = VK_IMAGE_LAYOUT_GENERAL;
-    initialBarrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    initialBarrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    initialBarrier.image = outImage;
-    initialBarrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-    initialBarrier.subresourceRange.baseMipLevel = 0;
-    initialBarrier.subresourceRange.levelCount = 1;
-    initialBarrier.subresourceRange.baseArrayLayer = 0;
-    initialBarrier.subresourceRange.layerCount = 1;
-    initialBarrier.srcAccessMask = (oldLayout == VK_IMAGE_LAYOUT_GENERAL)
-                                    ? VK_ACCESS_SHADER_WRITE_BIT : 0;
-    initialBarrier.dstAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+    if (!m_hasPrevCamera) {
+        m_prevCamPosX = m_camPosX;
+        m_prevCamPosY = m_camPosY;
+        m_prevCamPosZ = m_camPosZ;
+        m_prevCamDirX = m_camDirX;
+        m_prevCamDirY = m_camDirY;
+        m_prevCamDirZ = m_camDirZ;
+        m_prevCamUpX = m_camUpX;
+        m_prevCamUpY = m_camUpY;
+        m_prevCamUpZ = m_camUpZ;
+        m_prevFov = m_fov;
+        m_prevAspect = m_aspect;
+        m_prevJitterX = 0.0f;
+        m_prevJitterY = 0.0f;
+        m_hasPrevCamera = true;
+    }
 
-    vkCmdPipelineBarrier(m_commandBuffer,
-                         VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
-                         VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR,
-                         0, 0, nullptr, 0, nullptr, 1, &initialBarrier);
+    uint32_t jitterPeriod = 64;
+    uint32_t jitterSample = (m_jitterIndex % jitterPeriod) + 1;
+    float jitterX = halton(jitterSample, 2) - 0.5f;
+    float jitterY = halton(jitterSample, 3) - 0.5f;
+    bool temporalJitter = dlssActive;
+    if (!temporalJitter) {
+        jitterX = 0.0f;
+        jitterY = 0.0f;
+    }
+    m_jitterX = jitterX;
+    m_jitterY = jitterY;
+
+    float rainShade = 1.0f - m_rainLevel * 0.55f - m_thunderLevel * 0.25f;
+    if (rainShade < 0.18f) rainShade = 0.18f;
+    float sunScale = m_sunIntensity * 1.1f * rainShade;
+    if (sunScale > 12.0f) sunScale = 12.0f;
+
+    RtPushConstants pc{};
+    pc.maxBounces = static_cast<uint32_t>(m_maxBounces);
+    pc.samplesPerPixel = static_cast<uint32_t>(m_spp);
+    pc.frameIndex = m_frameIndex;
+    pc.flags = 0;
+    if (m_denoiser && m_nrd && m_nrd->isInitialized()) pc.flags |= 1u;
+    if (m_pathTracing) pc.flags |= 2u;
+    pc.exposure = m_exposure;
+    pc.rayLength = m_rayLength;
+    pc.sunIntensity = sunScale;
+    pc.ambientIntensity = 0.35f;
+    pc.camPos[0] = m_camPosX;
+    pc.camPos[1] = m_camPosY;
+    pc.camPos[2] = m_camPosZ;
+    pc.camDir[0] = m_camDirX;
+    pc.camDir[1] = m_camDirY;
+    pc.camDir[2] = m_camDirZ;
+    pc.camUp[0] = m_camUpX;
+    pc.camUp[1] = m_camUpY;
+    pc.camUp[2] = m_camUpZ;
+    pc.fov = m_fov;
+    pc.aspect = m_aspect;
+    pc.time = m_time;
+    pc.wetness = m_dimension == 0 ? m_wetness : 0.0f;
+    pc.dynamicCount = m_dynamicCount;
+    pc.particleCount = 0;
+    pc.sunDir[0] = m_sunDirX;
+    pc.sunDir[1] = m_sunDirY;
+    pc.sunDir[2] = m_sunDirZ;
+    pc.weather[0] = m_rainLevel;
+    pc.weather[1] = m_thunderLevel;
+    pc.weather[2] = m_flash;
+    float coverage = 0.34f + m_rainLevel * 0.5f + m_thunderLevel * 0.16f;
+    if (coverage > 1.0f) coverage = 1.0f;
+    pc.weather[3] = coverage;
+    pc.pad0 = (m_snow > 0.01f) ? 2u : ((m_rainLevel > 0.01f) ? 1u : 0u);
+    pc.pad1 = 0u;
+    pc.prevCamPos[0] = m_prevCamPosX;
+    pc.prevCamPos[1] = m_prevCamPosY;
+    pc.prevCamPos[2] = m_prevCamPosZ;
+    pc.prevCamDir[0] = m_prevCamDirX;
+    pc.prevCamDir[1] = m_prevCamDirY;
+    pc.prevCamDir[2] = m_prevCamDirZ;
+    pc.prevCamUp[0] = m_prevCamUpX;
+    pc.prevCamUp[1] = m_prevCamUpY;
+    pc.prevCamUp[2] = m_prevCamUpZ;
+    pc.lens[0] = m_prevFov;
+    pc.lens[1] = m_prevAspect;
+    pc.lens[2] = jitterX;
+    pc.lens[3] = jitterY;
+    pc.misc[0] = m_atlasWidth > 0 ? 1.0f / static_cast<float>(m_atlasWidth) : 0.0f;
+    pc.misc[1] = m_atlasHeight > 0 ? 1.0f / static_cast<float>(m_atlasHeight) : 0.0f;
+    pc.misc[2] = (m_dimension == 0 && std::getenv("YAOGUANG_NOCLOUD") == nullptr) ? 1.0f : 0.0f;
+    if (std::getenv("YAOGUANG_DEBUG_MAT") != nullptr) pc.misc[2] = -1.0f;
+    pc.misc[3] = static_cast<float>(height);
+    pc.sunColor[0] = 1.0f;
+    pc.sunColor[1] = 0.97f;
+    pc.sunColor[2] = 0.94f;
+    pc.sunColor[3] = static_cast<float>(m_dimension);
+
+    bool cloudPass = !m_skipCloud && m_cloudPipeline != VK_NULL_HANDLE && pc.misc[2] > 0.5f &&
+                     m_cloudView[0] != VK_NULL_HANDLE && m_cloudWidth > 0 && m_cloudHeight > 0;
+    if (cloudPass) {
+        uint32_t writeIndex = m_cloudWriteIndex;
+        uint32_t readIndex = writeIndex ^ 1u;
+        VkDescriptorImageInfo writeInfo{m_cloudSampler, m_cloudView[writeIndex], VK_IMAGE_LAYOUT_GENERAL};
+        VkDescriptorImageInfo historyInfo{m_cloudSampler, m_cloudView[readIndex], VK_IMAGE_LAYOUT_GENERAL};
+        VkDescriptorImageInfo rtInfo{m_cloudSampler, m_cloudView[writeIndex], VK_IMAGE_LAYOUT_GENERAL};
+        VkWriteDescriptorSet frameWrites[3]{};
+        frameWrites[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        frameWrites[0].dstSet = m_cloudSet;
+        frameWrites[0].dstBinding = 0;
+        frameWrites[0].descriptorCount = 1;
+        frameWrites[0].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+        frameWrites[0].pImageInfo = &writeInfo;
+        frameWrites[1].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        frameWrites[1].dstSet = m_cloudSet;
+        frameWrites[1].dstBinding = 1;
+        frameWrites[1].descriptorCount = 1;
+        frameWrites[1].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        frameWrites[1].pImageInfo = &historyInfo;
+        frameWrites[2].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        frameWrites[2].dstSet = m_descriptorSet;
+        frameWrites[2].dstBinding = 13;
+        frameWrites[2].descriptorCount = 1;
+        frameWrites[2].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        frameWrites[2].pImageInfo = &rtInfo;
+        vkUpdateDescriptorSets(m_device, 3, frameWrites, 0, nullptr);
+        m_cloudWriteIndex = readIndex;
+        if (!m_cloudInitialized) {
+            VkImageMemoryBarrier initial{};
+            initial.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+            initial.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+            initial.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+            initial.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            initial.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            initial.image = m_cloudImage[0];
+            initial.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+            initial.srcAccessMask = 0;
+            initial.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+            vkCmdPipelineBarrier(m_commandBuffer, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                                 VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &initial);
+            initial.image = m_cloudImage[1];
+            vkCmdPipelineBarrier(m_commandBuffer, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                                 VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &initial);
+            VkClearColorValue clearValue{};
+            clearValue.float32[0] = 0.0f;
+            clearValue.float32[1] = 0.0f;
+            clearValue.float32[2] = 0.0f;
+            clearValue.float32[3] = 1.0f;
+            VkImageSubresourceRange clearRange{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+            vkCmdClearColorImage(m_commandBuffer, m_cloudImage[0], VK_IMAGE_LAYOUT_GENERAL, &clearValue,
+                                 1, &clearRange);
+            vkCmdClearColorImage(m_commandBuffer, m_cloudImage[1], VK_IMAGE_LAYOUT_GENERAL, &clearValue,
+                                 1, &clearRange);
+            VkImageMemoryBarrier clearToWrite{};
+            clearToWrite.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+            clearToWrite.oldLayout = VK_IMAGE_LAYOUT_GENERAL;
+            clearToWrite.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+            clearToWrite.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            clearToWrite.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            clearToWrite.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+            clearToWrite.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+            clearToWrite.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+            clearToWrite.image = m_cloudImage[0];
+            vkCmdPipelineBarrier(m_commandBuffer, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                                 VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, nullptr, 0, nullptr, 1,
+                                 &clearToWrite);
+            clearToWrite.image = m_cloudImage[1];
+            vkCmdPipelineBarrier(m_commandBuffer, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                                 VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, nullptr, 0, nullptr, 1,
+                                 &clearToWrite);
+            m_cloudInitialized = true;
+        }
+        if (m_frameIndex < 3) std::cout << "[FR] cloud pass" << std::endl;
+        vkCmdBindPipeline(m_commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, m_cloudPipeline);
+        vkCmdBindDescriptorSets(m_commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, m_cloudLayout,
+                                0, 1, &m_cloudSet, 0, nullptr);
+        vkCmdPushConstants(m_commandBuffer, m_cloudLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
+        vkCmdDispatch(m_commandBuffer, (m_cloudWidth + 7) / 8, (m_cloudHeight + 7) / 8, 1);
+
+        if (!m_cloudInitialized) m_cloudInitialized = true;
+
+        VkMemoryBarrier cloudBarrier{};
+        cloudBarrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+        cloudBarrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+        cloudBarrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+        vkCmdPipelineBarrier(m_commandBuffer, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                             VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR, 0, 1, &cloudBarrier, 0, nullptr, 0, nullptr);
+    }
 
     vkCmdBindPipeline(m_commandBuffer, VK_PIPELINE_BIND_POINT_RAY_TRACING_KHR, m_pipeline);
     vkCmdBindDescriptorSets(m_commandBuffer, VK_PIPELINE_BIND_POINT_RAY_TRACING_KHR,
                             m_pipelineLayout, 0, 1, &m_descriptorSet, 0, nullptr);
 
-    RtPushConstants pc{};
-    pc.maxBounces = (uint32_t)m_maxBounces;
-    pc.samplesPerPixel = (uint32_t)m_spp;
-    pc.frameIndex = m_frameIndex++;
-    pc.pathTracingEnabled = m_pathTracing ? 1u : 0u;
-    pc.exposure = m_exposure;
-    pc.rayLength = m_rayLength;
-    pc.sunIntensity = m_sunIntensity;
-    pc.ambientIntensity = 0.35f;
-    pc.camPosX = m_camPosX;
-    pc.camPosY = m_camPosY;
-    pc.camPosZ = m_camPosZ;
-    pc.camDirX = m_camDirX;
-    pc.camDirY = m_camDirY;
-    pc.camDirZ = m_camDirZ;
-    pc.camUpX = m_camUpX;
-    pc.camUpY = m_camUpY;
-    pc.camUpZ = m_camUpZ;
-    pc.fov = m_fov;
-    pc.aspect = m_aspect;
-    pc.denoiserEnabled = m_denoiser ? 1u : 0u;
-    pc.dynamicCount = m_dynamicCount;
-    pc.sunDirX = m_sunDirX;
-    pc.sunDirY = m_sunDirY;
-    pc.sunDirZ = m_sunDirZ;
-    pc.rainLevel = m_rainLevel;
-    pc.thunderLevel = m_thunderLevel;
-    pc.particleCount = m_particleCount;
-    pc._pad2 = 0.0f;
-
     vkCmdPushConstants(m_commandBuffer, m_pipelineLayout,
                        VK_SHADER_STAGE_RAYGEN_BIT_KHR |
                        VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR |
+                       VK_SHADER_STAGE_ANY_HIT_BIT_KHR |
                        VK_SHADER_STAGE_MISS_BIT_KHR,
                        0, sizeof(pc), &pc);
 
-    m_vkCmdTraceRaysKHR(m_commandBuffer,
-                        &m_sbtRayGen, &m_sbtMiss, &m_sbtHit, &m_sbtCallable,
-                        w, h, 1);
+    if (m_frameIndex < 3) std::cout << "[FR] trace" << std::endl;
+    m_vkCmdTraceRaysKHR(m_commandBuffer, &m_sbtRayGen, &m_sbtMiss, &m_sbtHit,
+                        &m_sbtCallable, width, height, 1);
 
-    VkMemoryBarrier memBarrier{};
-    memBarrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
-    memBarrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
-    memBarrier.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_SHADER_READ_BIT;
-
+    VkMemoryBarrier memoryBarrier{};
+    memoryBarrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+    memoryBarrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+    memoryBarrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
     vkCmdPipelineBarrier(m_commandBuffer,
                          VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR,
+                         VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                         0, 1, &memoryBarrier, 0, nullptr, 0, nullptr);
+
+    if (m_frameIndex == 0 && m_debugMapped != nullptr) {
+        VkImageMemoryBarrier probeBarrier{};
+        probeBarrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+        probeBarrier.oldLayout = VK_IMAGE_LAYOUT_GENERAL;
+        probeBarrier.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+        probeBarrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        probeBarrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        probeBarrier.image = m_diffuse.image;
+        probeBarrier.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+        probeBarrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+        probeBarrier.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+        vkCmdPipelineBarrier(m_commandBuffer, VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR,
+                             VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &probeBarrier);
+        VkBufferImageCopy probeCopy{};
+        probeCopy.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+        probeCopy.imageOffset = {static_cast<int32_t>(width / 2 - 32), static_cast<int32_t>(height / 2 - 18), 0};
+        probeCopy.imageExtent = {64, 36, 1};
+        vkCmdCopyImageToBuffer(m_commandBuffer, m_diffuse.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                               m_debugBuffer, 1, &probeCopy);
+        probeBarrier.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+        probeBarrier.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+        probeBarrier.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+        probeBarrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+        vkCmdPipelineBarrier(m_commandBuffer, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                             VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, nullptr, 0, nullptr, 1, &probeBarrier);
+    }
+
+    bool denoised = false;
+    if (m_frameIndex < 3) std::cout << "[FR] nrd" << std::endl;
+    if (m_skipNrd) { m_denoiser = false; }
+    if (m_denoiser && m_nrd && m_nrd->isInitialized()) {
+        NrdInputs inputs{};
+        inputs.diffuse = m_diffuse.image;
+        inputs.diffuseView = m_diffuse.view;
+        inputs.specular = m_specular.image;
+        inputs.specularView = m_specular.view;
+        inputs.normal = m_normalRough.image;
+        inputs.normalView = m_normalRough.view;
+        inputs.viewZ = m_viewZ.image;
+        inputs.viewZView = m_viewZ.view;
+        inputs.motion = m_motion.image;
+        inputs.motionView = m_motion.view;
+
+        NrdCamera camera{};
+        camera.posX = m_camPosX;
+        camera.posY = m_camPosY;
+        camera.posZ = m_camPosZ;
+        camera.dirX = m_camDirX;
+        camera.dirY = m_camDirY;
+        camera.dirZ = m_camDirZ;
+        camera.upX = m_camUpX;
+        camera.upY = m_camUpY;
+        camera.upZ = m_camUpZ;
+        camera.fov = m_fov;
+        camera.aspect = m_aspect;
+        camera.prevPosX = m_prevCamPosX;
+        camera.prevPosY = m_prevCamPosY;
+        camera.prevPosZ = m_prevCamPosZ;
+        camera.prevDirX = m_prevCamDirX;
+        camera.prevDirY = m_prevCamDirY;
+        camera.prevDirZ = m_prevCamDirZ;
+        camera.prevUpX = m_prevCamUpX;
+        camera.prevUpY = m_prevCamUpY;
+        camera.prevUpZ = m_prevCamUpZ;
+        camera.prevFov = m_prevFov;
+        camera.prevAspect = m_prevAspect;
+        camera.jitterX = jitterX / static_cast<float>(width);
+        camera.jitterY = jitterY / static_cast<float>(height);
+        camera.prevJitterX = m_prevJitterX / static_cast<float>(width);
+        camera.prevJitterY = m_prevJitterY / static_cast<float>(height);
+        camera.timeDelta = 1.0f / 60.0f;
+        camera.frameIndex = m_frameIndex;
+        denoised = m_nrd->denoise(m_commandBuffer, inputs, camera);
+    }
+
+    if (m_frameIndex < 3) std::cout << "[FR] combine" << std::endl;
+    barrierToGeneral(m_commandBuffer, m_hdr);
+    barrierToGeneral(m_commandBuffer, m_depth);
+    updateCombineDescriptorSet(denoised);
+
+    VkMemoryBarrier combineBarrier{};
+    combineBarrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+    combineBarrier.srcAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+    combineBarrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+    vkCmdPipelineBarrier(m_commandBuffer,
+                         VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                         VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                         0, 1, &combineBarrier, 0, nullptr, 0, nullptr);
+
+    vkCmdBindPipeline(m_commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, m_combinePipeline);
+    vkCmdBindDescriptorSets(m_commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE,
+                            m_combineLayout, 0, 1, &m_combineSet, 0, nullptr);
+    CombinePushConstants combine{};
+    combine.exposure = 1.0f;
+    combine.farPlane = 512.0f;
+    combine.width = width;
+    combine.height = height;
+    combine.pad0 = 0;
+    combine.pad1 = 0;
+    vkCmdPushConstants(m_commandBuffer, m_combineLayout, VK_SHADER_STAGE_COMPUTE_BIT,
+                       0, sizeof(combine), &combine);
+    vkCmdDispatch(m_commandBuffer, (width + 7) / 8, (height + 7) / 8, 1);
+
+    if (wantStats) {
+        VkImageMemoryBarrier statsBarrier{};
+        statsBarrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+        statsBarrier.oldLayout = VK_IMAGE_LAYOUT_GENERAL;
+        statsBarrier.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+        statsBarrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        statsBarrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        statsBarrier.image = m_hdr.image;
+        statsBarrier.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+        statsBarrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+        statsBarrier.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+        vkCmdPipelineBarrier(m_commandBuffer, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                             VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &statsBarrier);
+
+        VkBufferImageCopy statsCopy{};
+        statsCopy.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+        statsCopy.imageOffset = {static_cast<int32_t>(width / 2 - 32), static_cast<int32_t>(height / 2 - 18), 0};
+        statsCopy.imageExtent = {64, 36, 1};
+        vkCmdCopyImageToBuffer(m_commandBuffer, m_hdr.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                               m_debugBuffer, 1, &statsCopy);
+
+        statsBarrier.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+        statsBarrier.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+        statsBarrier.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+        statsBarrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+        vkCmdPipelineBarrier(m_commandBuffer, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                             VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, nullptr, 0, nullptr, 1, &statsBarrier);
+    }
+
+    VkMemoryBarrier dlssBarrier{};
+    dlssBarrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+    dlssBarrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+    dlssBarrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+    vkCmdPipelineBarrier(m_commandBuffer,
+                         VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                         VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                         0, 1, &dlssBarrier, 0, nullptr, 0, nullptr);
+
+    VkImageView compositeSource = m_hdr.view;
+    uint32_t compositeSourceWidth = width;
+    uint32_t compositeSourceHeight = height;
+    bool upscale = width != outputWidth || height != outputHeight;
+
+    if (m_frameIndex < 3) std::cout << "[FR] dlss" << std::endl;
+    if (dlssActive) {
+        barrierToGeneral(m_commandBuffer, m_dlssOutput);
+        bool reset = m_frameIndex == 0;
+        if (m_dlss->evaluate(m_commandBuffer,
+                             m_hdr.image, m_hdr.view,
+                             m_depth.image, m_depth.view,
+                             m_motion.image, m_motion.view,
+                             m_dlssOutput.image, m_dlssOutput.view,
+                             jitterX, jitterY, reset)) {
+            compositeSource = m_dlssOutput.view;
+            compositeSourceWidth = outputWidth;
+            compositeSourceHeight = outputHeight;
+            upscale = false;
+        }
+    }
+
+    if (wantDlssCheck && compositeSource == m_dlssOutput.view) {
+        VkImageMemoryBarrier checkBarrier{};
+        checkBarrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+        checkBarrier.oldLayout = VK_IMAGE_LAYOUT_GENERAL;
+        checkBarrier.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+        checkBarrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        checkBarrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        checkBarrier.image = m_dlssOutput.image;
+        checkBarrier.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+        checkBarrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+        checkBarrier.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+        vkCmdPipelineBarrier(m_commandBuffer, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                             VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &checkBarrier);
+        VkBufferImageCopy checkCopy{};
+        checkCopy.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+        checkCopy.imageOffset = {static_cast<int32_t>(outputWidth / 2 - 32), static_cast<int32_t>(outputHeight / 2 - 18), 0};
+        checkCopy.imageExtent = {64, 36, 1};
+        vkCmdCopyImageToBuffer(m_commandBuffer, m_dlssOutput.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                               m_debugBuffer, 1, &checkCopy);
+        checkBarrier.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+        checkBarrier.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+        checkBarrier.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+        checkBarrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+        vkCmdPipelineBarrier(m_commandBuffer, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                             VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, nullptr, 0, nullptr, 1, &checkBarrier);
+    }
+
+    if (captureThisFrame && ensureCaptureBuffer(width, height)) {
+        VkImageMemoryBarrier captureBarrier{};
+        captureBarrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+        captureBarrier.oldLayout = VK_IMAGE_LAYOUT_GENERAL;
+        captureBarrier.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+        captureBarrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        captureBarrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        captureBarrier.image = m_hdr.image;
+        captureBarrier.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+        captureBarrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+        captureBarrier.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+        vkCmdPipelineBarrier(m_commandBuffer, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                             VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &captureBarrier);
+        VkBufferImageCopy captureCopy{};
+        captureCopy.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+        captureCopy.imageExtent = {width, height, 1};
+        vkCmdCopyImageToBuffer(m_commandBuffer, m_hdr.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                               m_captureBuffer, 1, &captureCopy);
+        captureBarrier.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+        captureBarrier.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+        captureBarrier.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+        captureBarrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+        vkCmdPipelineBarrier(m_commandBuffer, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                             VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, nullptr, 0, nullptr, 1, &captureBarrier);
+        m_capturePending = true;
+    }
+
+    if (m_frameIndex < 3) std::cout << "[FR] composite" << std::endl;
+
+    VkImageMemoryBarrier historyBarriers[2]{};
+    bool historyInitialized = false;
+    for (uint32_t i = 0; i < 2; i++) {
+        Target& h = m_taaHistory[i];
+        if (h.image == VK_NULL_HANDLE) continue;
+        historyInitialized = h.initialized;
+        historyBarriers[i].sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+        historyBarriers[i].oldLayout = h.initialized ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_UNDEFINED;
+        historyBarriers[i].newLayout = VK_IMAGE_LAYOUT_GENERAL;
+        historyBarriers[i].srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        historyBarriers[i].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        historyBarriers[i].image = h.image;
+        historyBarriers[i].subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        historyBarriers[i].subresourceRange.baseMipLevel = 0;
+        historyBarriers[i].subresourceRange.levelCount = 1;
+        historyBarriers[i].subresourceRange.baseArrayLayer = 0;
+        historyBarriers[i].subresourceRange.layerCount = 1;
+        historyBarriers[i].srcAccessMask = h.initialized ? VK_ACCESS_SHADER_WRITE_BIT : 0;
+        historyBarriers[i].dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+        h.initialized = true;
+    }
+    vkCmdPipelineBarrier(m_commandBuffer,
+                         historyInitialized ? VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT : VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                         VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                         0, 0, nullptr, 0, nullptr, 2, historyBarriers);
+
+    updateCompositeDescriptorSet(compositeSource, compositeSourceWidth, compositeSourceHeight, upscale);
+
+    VkMemoryBarrier compositeBarrier{};
+    compositeBarrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+    compositeBarrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_SHADER_READ_BIT;
+    compositeBarrier.dstAccessMask = VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_SHADER_READ_BIT;
+    vkCmdPipelineBarrier(m_commandBuffer,
+                         VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                         VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                         0, 1, &compositeBarrier, 0, nullptr, 0, nullptr);
+
+    vkCmdBindPipeline(m_commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, m_compositePipeline);
+    vkCmdBindDescriptorSets(m_commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE,
+                            m_compositeLayout, 0, 1, &m_compositeSet, 0, nullptr);
+
+    CompositePushConstants composite{};
+    composite.exposure = m_exposure;
+    composite.sharpen = dlssActive ? 1.45f : 0.8f;
+    composite.width = outputWidth;
+    composite.height = outputHeight;
+    composite.sourceWidth = compositeSourceWidth;
+    composite.sourceHeight = compositeSourceHeight;
+    composite.upscale = upscale ? 1u : 0u;
+    composite.pad0 = (std::getenv("YAOGUANG_MBLUR") != nullptr) ? 1u : 0u;
+    float cameraSpeed = 0.0f;
+    if (m_hasPrevCamera) {
+        float dx = pc.camDir[0] - m_prevCamDirX;
+        float dy = pc.camDir[1] - m_prevCamDirY;
+        float dz = pc.camDir[2] - m_prevCamDirZ;
+        cameraSpeed = std::sqrt(dx * dx + dy * dy + dz * dz);
+        float px = pc.camPos[0] - m_prevCamPosX;
+        float py = pc.camPos[1] - m_prevCamPosY;
+        float pz = pc.camPos[2] - m_prevCamPosZ;
+        cameraSpeed += std::sqrt(px * px + py * py + pz * pz) * 0.08f;
+    }
+    float temporalBlend = 0.62f + std::min(cameraSpeed * 5.0f, 0.30f);
+    composite.blend = dlssActive ? 1.0f : temporalBlend;
+    composite.reset = (m_frameIndex < 2 || m_taaReset) ? 1u : 0u;
+    vkCmdPushConstants(m_commandBuffer, m_compositeLayout, VK_SHADER_STAGE_COMPUTE_BIT,
+                       0, sizeof(composite), &composite);
+    vkCmdDispatch(m_commandBuffer, (outputWidth + 7) / 8, (outputHeight + 7) / 8, 1);
+    m_taaIndex ^= 1u;
+    m_taaReset = false;
+
+    VkMemoryBarrier finalBarrier{};
+    finalBarrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+    finalBarrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+    finalBarrier.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
+    vkCmdPipelineBarrier(m_commandBuffer,
+                         VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                          VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
-                         0, 1, &memBarrier, 0, nullptr, 0, nullptr);
+                         0, 1, &finalBarrier, 0, nullptr, 0, nullptr);
 
     vkEndCommandBuffer(m_commandBuffer);
+    if (m_frameIndex < 3) std::cout << "[FR] submit" << std::endl;
 
     VkSubmitInfo submitInfo{};
     submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
     submitInfo.commandBufferCount = 1;
     submitInfo.pCommandBuffers = &m_commandBuffer;
+    VkResult submitResult = vkQueueSubmit(m_queue, 1, &submitInfo, m_fence);
+    if (submitResult != VK_SUCCESS) {
+        std::cerr << "[Yaoguang] renderFrame submit failed: " << submitResult << std::endl;
+        if (submitResult == VK_ERROR_DEVICE_LOST) {
+            if (!m_deviceLost) {
+                std::cerr << "[Yaoguang] GPU device lost (submit) - ray tracing disabled until restart" << std::endl;
+            }
+            m_deviceLost = true;
+        }
+        m_frameTimedOut = true;
+        return;
+    }
+    VkResult waitResult = vkWaitForFences(m_device, 1, &m_fence, VK_TRUE, 1500000000ULL);
+    if (waitResult != VK_SUCCESS) {
+        std::cerr << "[Yaoguang] renderFrame fence wait failed: " << waitResult << std::endl;
+        if (waitResult == VK_ERROR_DEVICE_LOST) {
+            if (!m_deviceLost) {
+                std::cerr << "[Yaoguang] GPU device lost (fence) - ray tracing disabled until restart" << std::endl;
+            }
+            m_deviceLost = true;
+        }
+        m_frameTimedOut = true;
+        return;
+    }
 
-    vkQueueSubmit(m_queue, 1, &submitInfo, m_fence);
-    vkWaitForFences(m_device, 1, &m_fence, VK_TRUE, UINT64_MAX);
-    vkQueueWaitIdle(m_queue);
+    m_prevCamPosX = m_camPosX;
+    m_prevCamPosY = m_camPosY;
+    m_prevCamPosZ = m_camPosZ;
+    m_prevCamDirX = m_camDirX;
+    m_prevCamDirY = m_camDirY;
+    m_prevCamDirZ = m_camDirZ;
+    m_prevCamUpX = m_camUpX;
+    m_prevCamUpY = m_camUpY;
+    m_prevCamUpZ = m_camUpZ;
+    m_prevFov = m_fov;
+    m_prevAspect = m_aspect;
+    if (m_capturePending) {
+        const char* captureDir = std::getenv("YAOGUANG_CAPTURE_DIR");
+        if (captureDir != nullptr && captureDir[0] != '\0') {
+            std::string path(captureDir);
+            if (path.back() != '\\' && path.back() != '/') path += '\\';
+            path += (m_frameIndex >= 900) ? "frame_capture_b.ppm" : "frame_capture_a.ppm";
+            writeCaptureToPpm(path.c_str());
+        }
+        m_capturePending = false;
+    }
+    if (probeThisFrame) {
+        std::cout << "[Yaoguang] trace probe diffuseMean=" << debugBufferMean() << std::endl;
+    }
+    if (wantDlssCheck) {
+        float dlssMean = debugBufferMean();
+        std::cout << "[Yaoguang] dlss output mean=" << dlssMean << std::endl;
+        if (dlssMean < 1.0e-6f) {
+            std::cout << "[Yaoguang] DLSS produced black output, disabling DLSS" << std::endl;
+            m_dlss->shutdown();
+            m_dlss.reset();
+            m_dlssQuality = 5;
+            m_width = 0;
+        }
+    }
+    if (wantStats) reportFrameStats();
+
+    m_prevJitterX = jitterX;
+    m_prevJitterY = jitterY;
+    m_jitterIndex++;
+    m_frameIndex++;
+
+    float targetWetness = std::min(1.0f, m_rainLevel * 1.15f);
+    float rate = targetWetness > m_wetness ? 0.06f : 0.012f;
+    m_wetness += (targetWetness - m_wetness) * rate;
 }
 
 void RayTracingPipeline::shutdown() {
@@ -982,23 +3096,127 @@ void RayTracingPipeline::shutdown() {
     vkDeviceWaitIdle(m_device);
 
     destroySBT();
+    destroyCloudResources();
+    destroyTargets();
     destroyAtlas();
     destroyParticleAtlas();
 
-    if (m_atlasSampler) { vkDestroySampler(m_device, m_atlasSampler, nullptr); m_atlasSampler = VK_NULL_HANDLE; }
+    if (m_dummyAtlasView != VK_NULL_HANDLE) {
+        vkDestroyImageView(m_device, m_dummyAtlasView, nullptr);
+        m_dummyAtlasView = VK_NULL_HANDLE;
+    }
+    if (m_dummyAtlasImage != VK_NULL_HANDLE) {
+        vkDestroyImage(m_device, m_dummyAtlasImage, nullptr);
+        m_dummyAtlasImage = VK_NULL_HANDLE;
+    }
+    if (m_dummyAtlasMemory != VK_NULL_HANDLE) {
+        vkFreeMemory(m_device, m_dummyAtlasMemory, nullptr);
+        m_dummyAtlasMemory = VK_NULL_HANDLE;
+    }
 
-    if (m_dynamicMapped) { vkUnmapMemory(m_device, m_dynamicMemory); m_dynamicMapped = nullptr; }
-    if (m_dynamicBuffer) { vkDestroyBuffer(m_device, m_dynamicBuffer, nullptr); m_dynamicBuffer = VK_NULL_HANDLE; }
-    if (m_dynamicMemory) { vkFreeMemory(m_device, m_dynamicMemory, nullptr); m_dynamicMemory = VK_NULL_HANDLE; }
+    if (m_transmittanceLutSampler != VK_NULL_HANDLE) {
+        vkDestroySampler(m_device, m_transmittanceLutSampler, nullptr);
+        m_transmittanceLutSampler = VK_NULL_HANDLE;
+    }
+    if (m_transmittanceLutView != VK_NULL_HANDLE) {
+        vkDestroyImageView(m_device, m_transmittanceLutView, nullptr);
+        m_transmittanceLutView = VK_NULL_HANDLE;
+    }
+    if (m_transmittanceLutImage != VK_NULL_HANDLE) {
+        vkDestroyImage(m_device, m_transmittanceLutImage, nullptr);
+        m_transmittanceLutImage = VK_NULL_HANDLE;
+    }
+    if (m_transmittanceLutMemory != VK_NULL_HANDLE) {
+        vkFreeMemory(m_device, m_transmittanceLutMemory, nullptr);
+        m_transmittanceLutMemory = VK_NULL_HANDLE;
+    }
 
-    if (m_particleMapped) { vkUnmapMemory(m_device, m_particleMemory); m_particleMapped = nullptr; }
-    if (m_particleBuffer) { vkDestroyBuffer(m_device, m_particleBuffer, nullptr); m_particleBuffer = VK_NULL_HANDLE; }
-    if (m_particleMemory) { vkFreeMemory(m_device, m_particleMemory, nullptr); m_particleMemory = VK_NULL_HANDLE; }
+    if (m_atlasSampler != VK_NULL_HANDLE) {
+        vkDestroySampler(m_device, m_atlasSampler, nullptr);
+        m_atlasSampler = VK_NULL_HANDLE;
+    }
 
-    if (m_fence) { vkDestroyFence(m_device, m_fence, nullptr); m_fence = VK_NULL_HANDLE; }
-    if (m_commandPool) { vkDestroyCommandPool(m_device, m_commandPool, nullptr); m_commandPool = VK_NULL_HANDLE; m_commandBuffer = VK_NULL_HANDLE; }
-    if (m_descriptorPool) { vkDestroyDescriptorPool(m_device, m_descriptorPool, nullptr); m_descriptorPool = VK_NULL_HANDLE; m_descriptorSet = VK_NULL_HANDLE; }
-    if (m_pipeline) { vkDestroyPipeline(m_device, m_pipeline, nullptr); m_pipeline = VK_NULL_HANDLE; }
-    if (m_pipelineLayout) { vkDestroyPipelineLayout(m_device, m_pipelineLayout, nullptr); m_pipelineLayout = VK_NULL_HANDLE; }
-    if (m_descriptorSetLayout) { vkDestroyDescriptorSetLayout(m_device, m_descriptorSetLayout, nullptr); m_descriptorSetLayout = VK_NULL_HANDLE; }
+    if (m_dynamicMapped) {
+        vkUnmapMemory(m_device, m_dynamicMemory);
+        m_dynamicMapped = nullptr;
+    }
+    if (m_dynamicBuffer != VK_NULL_HANDLE) {
+        vkDestroyBuffer(m_device, m_dynamicBuffer, nullptr);
+        m_dynamicBuffer = VK_NULL_HANDLE;
+    }
+    if (m_dynamicMemory != VK_NULL_HANDLE) {
+        vkFreeMemory(m_device, m_dynamicMemory, nullptr);
+        m_dynamicMemory = VK_NULL_HANDLE;
+    }
+
+    if (m_particleMapped) {
+        vkUnmapMemory(m_device, m_particleMemory);
+        m_particleMapped = nullptr;
+    }
+    if (m_particleBuffer != VK_NULL_HANDLE) {
+        vkDestroyBuffer(m_device, m_particleBuffer, nullptr);
+        m_particleBuffer = VK_NULL_HANDLE;
+    }
+    if (m_particleMemory != VK_NULL_HANDLE) {
+        vkFreeMemory(m_device, m_particleMemory, nullptr);
+        m_particleMemory = VK_NULL_HANDLE;
+    }
+
+    m_nrd.reset();
+
+    if (m_dlss) {
+        m_dlss->shutdown();
+        m_dlss.reset();
+    }
+
+    destroyCombineResources();
+
+    if (m_compositePipeline != VK_NULL_HANDLE) {
+        vkDestroyPipeline(m_device, m_compositePipeline, nullptr);
+        m_compositePipeline = VK_NULL_HANDLE;
+    }
+    if (m_compositeLayout != VK_NULL_HANDLE) {
+        vkDestroyPipelineLayout(m_device, m_compositeLayout, nullptr);
+        m_compositeLayout = VK_NULL_HANDLE;
+    }
+    if (m_compositeSetLayout != VK_NULL_HANDLE) {
+        vkDestroyDescriptorSetLayout(m_device, m_compositeSetLayout, nullptr);
+        m_compositeSetLayout = VK_NULL_HANDLE;
+    }
+    if (m_compositePool != VK_NULL_HANDLE) {
+        vkDestroyDescriptorPool(m_device, m_compositePool, nullptr);
+        m_compositePool = VK_NULL_HANDLE;
+    }
+    if (m_compositeSampler != VK_NULL_HANDLE) {
+        vkDestroySampler(m_device, m_compositeSampler, nullptr);
+        m_compositeSampler = VK_NULL_HANDLE;
+    }
+
+    if (m_fence != VK_NULL_HANDLE) {
+        vkDestroyFence(m_device, m_fence, nullptr);
+        m_fence = VK_NULL_HANDLE;
+    }
+    if (m_commandPool != VK_NULL_HANDLE) {
+        vkDestroyCommandPool(m_device, m_commandPool, nullptr);
+        m_commandPool = VK_NULL_HANDLE;
+        m_commandBuffer = VK_NULL_HANDLE;
+    }
+    if (m_descriptorPool != VK_NULL_HANDLE) {
+        vkDestroyDescriptorPool(m_device, m_descriptorPool, nullptr);
+        m_descriptorPool = VK_NULL_HANDLE;
+        m_descriptorSet = VK_NULL_HANDLE;
+    }
+    if (m_pipeline != VK_NULL_HANDLE) {
+        vkDestroyPipeline(m_device, m_pipeline, nullptr);
+        m_pipeline = VK_NULL_HANDLE;
+    }
+    if (m_pipelineLayout != VK_NULL_HANDLE) {
+        vkDestroyPipelineLayout(m_device, m_pipelineLayout, nullptr);
+        m_pipelineLayout = VK_NULL_HANDLE;
+    }
+    if (m_descriptorSetLayout != VK_NULL_HANDLE) {
+        vkDestroyDescriptorSetLayout(m_device, m_descriptorSetLayout, nullptr);
+        m_descriptorSetLayout = VK_NULL_HANDLE;
+    }
+    m_device = VK_NULL_HANDLE;
 }

@@ -38,6 +38,11 @@ public final class CompositeRenderer {
     private static float lastYaw, lastPitch;
 
     private static volatile boolean pendingShutdown = false;
+    private static volatile boolean temporalAccumulation = true;
+
+    public static void setTemporalAccumulation(boolean enabled) {
+        temporalAccumulation = enabled;
+    }
 
     public static void notifyCamera(double x, double y, double z, float yaw, float pitch) {
         boolean moved = accumFrame > 0 && (
@@ -67,21 +72,22 @@ public final class CompositeRenderer {
     }
 
     public static void importSharedResources(long imageHandle, int width, int height) {
-        System.out.println("[Yaoguang] importShared: img=" + Long.toHexString(imageHandle)
-                + " size=" + width + "x" + height);
-
         if (imageHandle == 0L || width <= 0 || height <= 0) return;
 
         boolean imageChanged = (imageHandle != lastImportedHandle || width != texWidth || height != texHeight);
         if (!imageChanged) return;
 
-        if (importedMemoryObject != 0) {
-            EXTMemoryObject.glDeleteMemoryObjectsEXT(importedMemoryObject);
-            importedMemoryObject = 0;
-        }
+        System.out.println("[Yaoguang] importShared: img=" + Long.toHexString(imageHandle)
+                + " size=" + width + "x" + height);
+
+        GL11.glFinish();
         if (sharedTex != 0) {
             GL11.glDeleteTextures(sharedTex);
             sharedTex = 0;
+        }
+        if (importedMemoryObject != 0) {
+            EXTMemoryObject.glDeleteMemoryObjectsEXT(importedMemoryObject);
+            importedMemoryObject = 0;
         }
 
         importedMemoryObject = EXTMemoryObject.glCreateMemoryObjectsEXT();
@@ -143,15 +149,16 @@ public final class CompositeRenderer {
             try {
                 initAll();
                 initialized = true;
+                System.out.println("[Yaoguang] CompositeRenderer initialized");
             } catch (Throwable t) {
                 initFailed = true;
+                System.out.println("[Yaoguang] CompositeRenderer init failed: " + t);
+                t.printStackTrace();
                 return;
             }
         }
 
         if (width != texWidth || height != texHeight) return;
-
-        GL11.glFinish();
 
         int prevProg      = GL11.glGetInteger(GL20.GL_CURRENT_PROGRAM);
         int prevVao       = GL11.glGetInteger(GL30.GL_VERTEX_ARRAY_BINDING);
@@ -225,7 +232,7 @@ public final class CompositeRenderer {
         GL13.glActiveTexture(GL13.GL_TEXTURE0);
         GL11.glBindTexture(GL11.GL_TEXTURE_2D, sharedTex);
         if (locAccumNewFrame >= 0) GL20.glUniform1i(locAccumNewFrame, 0);
-        float mixAmount = (accumFrame == 0) ? 1.0f : (1.0f / (float)(accumFrame + 1));
+        float mixAmount = (!temporalAccumulation || accumFrame == 0) ? 1.0f : (1.0f / (float)(accumFrame + 1));
         if (mixAmount > 1.0f) mixAmount = 1.0f;
         if (locAccumMixAmount >= 0) GL20.glUniform1f(locAccumMixAmount, mixAmount);
 
@@ -252,14 +259,20 @@ public final class CompositeRenderer {
         if (wasBlend)   GL11.glEnable(GL11.GL_BLEND);
         if (wasDepth)   GL11.glEnable(GL11.GL_DEPTH_TEST);
         if (wasCull)    GL11.glEnable(GL11.GL_CULL_FACE);
+        GL11.glFinish();
         if (wasScissor) GL11.glEnable(GL11.GL_SCISSOR_TEST);
 
-        accumFrame++;
-        if (accumFrame > MAX_ACCUM) accumFrame = MAX_ACCUM;
+        if (temporalAccumulation) {
+            accumFrame++;
+            if (accumFrame > MAX_ACCUM) accumFrame = MAX_ACCUM;
+        } else {
+            accumFrame = 0;
+        }
         frameCount++;
     }
 
     public static void shutdown() {
+        GL11.glFinish();
         if (sharedTex != 0) {
             GL11.glDeleteTextures(sharedTex);
             sharedTex = 0;

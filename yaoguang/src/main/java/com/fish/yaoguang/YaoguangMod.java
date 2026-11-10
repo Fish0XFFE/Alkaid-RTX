@@ -12,6 +12,7 @@ public class YaoguangMod {
     public static final String MODID = "yaoguang";
 
     public YaoguangMod() {
+        System.out.println("[Yaoguang] mod constructor");
         if (FMLEnvironment.dist == Dist.CLIENT) {
             YaoguangConfig.init();
             VramExtender.setGameDir(FMLPaths.GAMEDIR.get());

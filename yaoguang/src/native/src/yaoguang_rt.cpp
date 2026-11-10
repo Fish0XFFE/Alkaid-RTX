@@ -21,12 +21,12 @@ std::unique_ptr<RayTracingPipeline> g_pipeline;
 std::unique_ptr<SceneAccel> g_scene;
 
 std::atomic<bool> g_rtEnabled{false};
-std::atomic<int>  g_maxBounces{4};
+std::atomic<int>  g_maxBounces{2};
 std::atomic<int>  g_spp{2};
 std::atomic<float> g_rayLength{64.0f};
 std::atomic<bool> g_denoiser{true};
-std::atomic<float> g_exposure{1.2f};
-std::atomic<bool> g_pathTracing{true};
+std::atomic<float> g_exposure{1.0f};
+std::atomic<bool> g_pathTracing{false};
 std::atomic<bool> g_vramExt{false};
 std::atomic<int>  g_vramSize{0};
 
@@ -178,11 +178,11 @@ Java_com_fish_yaoguang_nativebridge_YaoguangNative_setRayTracingEnabled(JNIEnv*,
 JNIEXPORT void JNICALL
 Java_com_fish_yaoguang_nativebridge_YaoguangNative_applyPreset(JNIEnv*, jclass, jint preset) {
     switch (preset) {
-        case 0: g_maxBounces.store(1); g_spp.store(1); g_denoiser.store(true); g_exposure.store(0.8f); g_pathTracing.store(false); break;
-        case 1: g_maxBounces.store(2); g_spp.store(2); g_denoiser.store(true); g_exposure.store(1.0f); g_pathTracing.store(true);  break;
-        case 2: g_maxBounces.store(4); g_spp.store(2); g_denoiser.store(true); g_exposure.store(1.2f); g_pathTracing.store(true);  break;
-        case 3: g_maxBounces.store(6); g_spp.store(4); g_denoiser.store(false); g_exposure.store(1.3f); g_pathTracing.store(true); break;
-        case 4: g_maxBounces.store(8); g_spp.store(8); g_denoiser.store(false); g_exposure.store(1.5f); g_pathTracing.store(true); break;
+        case 0: g_maxBounces.store(1); g_spp.store(1); g_denoiser.store(true); g_exposure.store(0.34f); g_pathTracing.store(false); break;
+        case 1: g_maxBounces.store(2); g_spp.store(1); g_denoiser.store(true); g_exposure.store(0.40f); g_pathTracing.store(false); break;
+        case 2: g_maxBounces.store(3); g_spp.store(1); g_denoiser.store(true); g_exposure.store(0.40f); g_pathTracing.store(false); break;
+        case 3: g_maxBounces.store(3); g_spp.store(1); g_denoiser.store(true); g_exposure.store(0.46f); g_pathTracing.store(false); break;
+        case 4: g_maxBounces.store(4); g_spp.store(2); g_denoiser.store(true); g_exposure.store(0.52f); g_pathTracing.store(false); break;
         default: break;
     }
     if (g_pipeline) {
@@ -263,6 +263,21 @@ Java_com_fish_yaoguang_nativebridge_YaoguangNative_onFrameBegin(JNIEnv*, jclass,
 }
 
 JNIEXPORT void JNICALL
+Java_com_fish_yaoguang_nativebridge_YaoguangNative_setRenderScale(JNIEnv*, jclass, jfloat scale) {
+    if (g_pipeline) g_pipeline->setRenderScale(scale);
+}
+
+JNIEXPORT void JNICALL
+Java_com_fish_yaoguang_nativebridge_YaoguangNative_setDlssQuality(JNIEnv*, jclass, jint quality) {
+    if (g_pipeline) g_pipeline->setDlssQuality(quality);
+}
+
+JNIEXPORT jboolean JNICALL
+Java_com_fish_yaoguang_nativebridge_YaoguangNative_isDlssAvailable(JNIEnv*, jclass) {
+    return (g_pipeline && g_pipeline->isDlssAvailable()) ? JNI_TRUE : JNI_FALSE;
+}
+
+JNIEXPORT void JNICALL
 Java_com_fish_yaoguang_nativebridge_YaoguangNative_onFrameEnd(JNIEnv*, jclass) {
 }
 
@@ -271,10 +286,11 @@ Java_com_fish_yaoguang_nativebridge_YaoguangNative_rebuildSceneAccel(JNIEnv*, jc
                                                                       jlong vertexPtr, jlong indexPtr,
                                                                       jint vertexCount, jint indexCount) {
     if (!g_scene) return;
-    g_scene->rebuild(reinterpret_cast<const float*>(vertexPtr),
-                     reinterpret_cast<const uint32_t*>(indexPtr),
-                     (uint32_t)vertexCount,
-                     (uint32_t)indexCount);
+    (void)vertexPtr;
+    (void)indexPtr;
+    if (vertexCount > 0 && indexCount > 0) {
+        g_scene->reserve((uint32_t)vertexCount, (uint32_t)indexCount);
+    }
 }
 
 JNIEXPORT jboolean JNICALL
@@ -356,15 +372,54 @@ Java_com_fish_yaoguang_nativebridge_YaoguangNative_getGlSignalSemaphoreHandle(JN
 }
 
 JNIEXPORT void JNICALL
+Java_com_fish_yaoguang_nativebridge_YaoguangNative_reserveScene(
+    JNIEnv*, jclass, jint vertexCount, jint indexCount) {
+    if (!g_scene) return;
+    if (vertexCount <= 0 || indexCount <= 0) return;
+    g_scene->reserve((uint32_t)vertexCount, (uint32_t)indexCount);
+}
+
+JNIEXPORT void JNICALL
 Java_com_fish_yaoguang_nativebridge_YaoguangNative_uploadSceneGeometry(
     JNIEnv* env, jclass, jfloatArray vertices, jintArray indices) {
+    if (!g_scene) return;
+    jsize vLen = env->GetArrayLength(vertices);
+    jsize iLen = env->GetArrayLength(indices);
+    if (vLen == 0 || iLen == 0) return;
+    if (vLen % 20 != 0) {
+        std::cerr << "[Yaoguang] uploadSceneGeometry: vLen not multiple of 20 (" << vLen << ")" << std::endl;
+        return;
+    }
+    g_scene->reserve((uint32_t)vLen, (uint32_t)iLen);
+    jfloat* vData = env->GetFloatArrayElements(vertices, nullptr);
+    jint* iData = env->GetIntArrayElements(indices, nullptr);
+    if (vData && iData) {
+        g_scene->beginUpdate();
+        g_scene->setChunk(0u, 0, 0, reinterpret_cast<const float*>(vData),
+                          (uint32_t)(vLen / 20),
+                          reinterpret_cast<const uint32_t*>(iData), (uint32_t)iLen);
+        g_scene->commit();
+    }
+    if (vData) env->ReleaseFloatArrayElements(vertices, vData, JNI_ABORT);
+    if (iData) env->ReleaseIntArrayElements(indices, iData, JNI_ABORT);
+}
+
+JNIEXPORT void JNICALL
+Java_com_fish_yaoguang_nativebridge_YaoguangNative_beginChunkBatch(JNIEnv*, jclass) {
+    if (!g_scene) return;
+    g_scene->beginUpdate();
+}
+
+JNIEXPORT void JNICALL
+Java_com_fish_yaoguang_nativebridge_YaoguangNative_uploadChunkGeometry(
+    JNIEnv* env, jclass, jint slot, jint chunkX, jint chunkZ, jfloatArray vertices, jintArray indices) {
     if (!g_scene) return;
 
     jsize vLen = env->GetArrayLength(vertices);
     jsize iLen = env->GetArrayLength(indices);
     if (vLen == 0 || iLen == 0) return;
-    if (vLen % 12 != 0) {
-        std::cerr << "[Yaoguang] uploadSceneGeometry: vLen not multiple of 12 ("
+    if (vLen % 20 != 0) {
+        std::cerr << "[Yaoguang] uploadChunkGeometry: vLen not multiple of 20 ("
                   << vLen << ")" << std::endl;
         return;
     }
@@ -373,14 +428,27 @@ Java_com_fish_yaoguang_nativebridge_YaoguangNative_uploadSceneGeometry(
     jint* iData = env->GetIntArrayElements(indices, nullptr);
 
     if (vData && iData) {
-        g_scene->rebuild(reinterpret_cast<const float*>(vData),
-                         reinterpret_cast<const uint32_t*>(iData),
-                         (uint32_t)(vLen / 12),
-                         (uint32_t)iLen);
+        g_scene->setChunk((uint32_t)slot, (int32_t)chunkX, (int32_t)chunkZ,
+                          reinterpret_cast<const float*>(vData),
+                          (uint32_t)(vLen / 20),
+                          reinterpret_cast<const uint32_t*>(iData),
+                          (uint32_t)iLen);
     }
 
     if (vData) env->ReleaseFloatArrayElements(vertices, vData, JNI_ABORT);
     if (iData) env->ReleaseIntArrayElements(indices, iData, JNI_ABORT);
+}
+
+JNIEXPORT void JNICALL
+Java_com_fish_yaoguang_nativebridge_YaoguangNative_removeChunkGeometry(JNIEnv*, jclass, jint slot) {
+    if (!g_scene) return;
+    g_scene->removeChunk((uint32_t)slot);
+}
+
+JNIEXPORT void JNICALL
+Java_com_fish_yaoguang_nativebridge_YaoguangNative_commitChunkBatch(JNIEnv*, jclass) {
+    if (!g_scene) return;
+    g_scene->commit();
 }
 
 JNIEXPORT void JNICALL
@@ -400,11 +468,40 @@ Java_com_fish_yaoguang_nativebridge_YaoguangNative_setSun(
 
 JNIEXPORT void JNICALL
 Java_com_fish_yaoguang_nativebridge_YaoguangNative_setWeather(
-    JNIEnv*, jclass, jfloat rain, jfloat thunder) {
+    JNIEnv*, jclass, jfloat rain, jfloat thunder, jfloat snow) {
     g_rainLevel.store(rain);
     g_thunderLevel.store(thunder);
     if (g_pipeline) {
-        g_pipeline->setWeather(rain, thunder);
+        g_pipeline->setWeather(rain, thunder, snow);
+    }
+}
+
+JNIEXPORT void JNICALL
+Java_com_fish_yaoguang_nativebridge_YaoguangNative_flushGpu(JNIEnv*, jclass) {
+    if (g_pipeline) {
+        g_pipeline->waitIdle();
+    }
+}
+
+JNIEXPORT jboolean JNICALL
+Java_com_fish_yaoguang_nativebridge_YaoguangNative_isDeviceLost(JNIEnv*, jclass) {
+    return (g_pipeline && g_pipeline->isDeviceLost()) ? JNI_TRUE : JNI_FALSE;
+}
+
+JNIEXPORT void JNICALL
+Java_com_fish_yaoguang_nativebridge_YaoguangNative_setDimension(
+    JNIEnv*, jclass, jint dimension) {
+    if (g_pipeline) {
+        g_pipeline->setDimension(static_cast<int>(dimension));
+    }
+}
+
+JNIEXPORT void JNICALL
+Java_com_fish_yaoguang_nativebridge_YaoguangNative_setEnvironment(
+    JNIEnv*, jclass, jfloat skyR, jfloat skyG, jfloat skyB,
+    jfloat cloudR, jfloat cloudG, jfloat cloudB, jfloat flash, jfloat time) {
+    if (g_pipeline) {
+        g_pipeline->setEnvironment(skyR, skyG, skyB, cloudR, cloudG, cloudB, flash, time);
     }
 }
 
@@ -416,6 +513,16 @@ Java_com_fish_yaoguang_nativebridge_YaoguangNative_uploadBlockAtlas(
     void* ptr = env->GetDirectBufferAddress(buffer);
     if (!ptr) return;
     g_pipeline->uploadAtlas(ptr, (uint32_t)width, (uint32_t)height);
+}
+
+JNIEXPORT void JNICALL
+Java_com_fish_yaoguang_nativebridge_YaoguangNative_uploadBlockAtlasLevel0(
+    JNIEnv* env, jclass, jint width, jint height, jobject buffer) {
+    if (!g_pipeline) return;
+    if (width <= 0 || height <= 0) return;
+    void* ptr = env->GetDirectBufferAddress(buffer);
+    if (!ptr) return;
+    g_pipeline->uploadAtlasLevel0(ptr, (uint32_t)width, (uint32_t)height);
 }
 
 JNIEXPORT void JNICALL

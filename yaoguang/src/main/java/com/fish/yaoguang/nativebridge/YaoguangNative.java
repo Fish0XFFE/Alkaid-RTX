@@ -20,6 +20,9 @@ public final class YaoguangNative {
     public static native void setPathTracingEnabled(boolean enabled);
     public static native void setVramExtension(boolean enabled, int gigabytes);
     public static native void onFrameBegin(long windowHandle, int width, int height);
+    public static native void setRenderScale(float scale);
+    public static native void setDlssQuality(int quality);
+    public static native boolean isDlssAvailable();
     public static native void onFrameEnd();
     public static native void rebuildSceneAccel(long vertexBufferPtr, long indexBufferPtr, int vertexCount, int indexCount);
     public static native boolean isRayTracingSupported();
@@ -38,9 +41,29 @@ public final class YaoguangNative {
     public static native long getVkSignalSemaphoreHandle();
     public static native long getGlSignalSemaphoreHandle();
     public static native void uploadSceneGeometry(float[] vertices, int[] indices);
+
+    public static native void reserveScene(int vertexCount, int indexCount);
+
+    public static native void beginChunkBatch();
+
+    public static native void uploadChunkGeometry(int slot, int chunkX, int chunkZ, float[] vertices, int[] indices);
+
+    public static native void removeChunkGeometry(int slot);
+
+    public static native void commitChunkBatch();
     public static native void setSun(float dx, float dy, float dz, float intensity);
-    public static native void setWeather(float rain, float thunder);
+    public static native void setWeather(float rain, float thunder, float snow);
+
+    public static native void setDimension(int dimension);
+
+    public static native void flushGpu();
+
+    public static native boolean isDeviceLost();
+    public static native void setEnvironment(float skyR, float skyG, float skyB,
+                                             float cloudR, float cloudG, float cloudB,
+                                             float flash, float time);
     public static native void uploadBlockAtlas(int width, int height, java.nio.ByteBuffer pixels);
+    public static native void uploadBlockAtlasLevel0(int width, int height, java.nio.ByteBuffer pixels);
     public static native void uploadDynamic(FloatBuffer data, int count);
     public static native void clearDynamic();
     public static native void uploadParticleAtlas(int width, int height, java.nio.ByteBuffer pixels);

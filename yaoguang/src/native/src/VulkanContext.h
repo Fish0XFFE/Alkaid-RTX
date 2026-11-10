@@ -43,6 +43,9 @@ private:
     GpuRayTracingUnit m_rayTracingUnit = GpuRayTracingUnit::NONE;
     std::string m_deviceName;
     VkDeviceSize m_virtualVramSize = 0;
+    VkBuffer m_virtualVramBuffer = VK_NULL_HANDLE;
+    VkDeviceMemory m_virtualVramMemory = VK_NULL_HANDLE;
+    void* m_virtualVramMapped = nullptr;
 
     bool m_externalMemoryInstanceSupported = false;
     bool m_externalSemaphoreInstanceSupported = false;

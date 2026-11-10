@@ -1,0 +1,1279 @@
+#version 460
+#extension GL_EXT_ray_tracing : require
+
+struct HitPayload {
+    vec3 albedo;
+    vec3 normal;
+    vec3 emissive;
+    vec3 transmittance;
+    vec2 uv;
+    float material;
+    float roughness;
+    float metalness;
+    float distance;
+    float skyLight;
+    float blockLight;
+    int op;
+};
+
+struct DynamicObj {
+    vec4 centerMat;
+    vec4 axisXHalf;
+    vec4 axisYHalf;
+    vec4 axisZHalf;
+    vec4 color;
+};
+
+struct ParticleObj {
+    vec4 posRadius;
+    vec4 colorAlpha;
+};
+
+struct RayHit {
+    vec3 position;
+    vec3 normal;
+    vec3 albedo;
+    vec3 emissive;
+    vec2 uv;
+    float material;
+    float roughness;
+    float metalness;
+    float distance;
+    float skyLight;
+    float blockLight;
+    bool hit;
+};
+
+struct LobeResult {
+    vec3 diffuse;
+    vec3 specular;
+    float specDistance;
+    vec3 normal;
+    float roughness;
+};
+
+layout(location = 0) rayPayloadEXT HitPayload payload;
+
+layout(binding = 0, rgba16f) uniform writeonly image2D outDiffuse;
+layout(binding = 1) uniform accelerationStructureEXT tlas;
+layout(binding = 2, std430) readonly buffer VertexBuffer { float verts[]; };
+layout(binding = 3, std430) readonly buffer IndexBuffer { uint idxs[]; };
+layout(binding = 4) uniform sampler2D atlasTex;
+layout(binding = 5, std430) readonly buffer DynamicBuffer { DynamicObj objs[]; };
+layout(binding = 6, std430) readonly buffer ParticleBuffer { ParticleObj particles[]; };
+layout(binding = 7, rgba16f) uniform writeonly image2D outSpecular;
+layout(binding = 8, rgb10_a2) uniform writeonly image2D outNormalRough;
+layout(binding = 9, r32f) uniform writeonly image2D outViewZ;
+layout(binding = 10, rg16f) uniform writeonly image2D outMotion;
+
+layout(push_constant) uniform PC {
+    uint maxBounces;
+    uint samplesPerPixel;
+    uint frameIndex;
+    uint flags;
+    float exposure;
+    float rayLength;
+    float sunIntensity;
+    float ambientIntensity;
+    vec4 camPos;
+    vec4 camDir;
+    vec4 camUp;
+    float fov;
+    float aspect;
+    float time;
+    float wetness;
+    uint dynamicCount;
+    uint particleCount;
+    uint pad0;
+    uint pad1;
+    vec4 sunDir;
+    vec4 weather;
+    vec4 prevCamPos;
+    vec4 prevCamDir;
+    vec4 prevCamUp;
+    vec4 lens;
+    vec4 misc;
+    vec4 sunColor;
+} pc;
+
+const float PI = 3.14159265358979;
+const float INF = 1.0e30;
+const float R_PLANET = 6360.0;
+const float R_ATMOS = 6420.0;
+const vec3 BETA_R = vec3(5.802e-3, 13.558e-3, 33.1e-3);
+const vec3 BETA_M = vec3(2.0e-3);
+const float H_R = 8.0;
+const float H_M = 1.2;
+const float CLOUD_BASE = 400.0;
+const float CLOUD_TOP = 1500.0;
+
+float saturate(float v) { return clamp(v, 0.0, 1.0); }
+float luminance(vec3 c) { return dot(c, vec3(0.2126, 0.7152, 0.0722)); }
+
+uint pcgNext(inout uint s) {
+    s = s * 747796405u + 2891336453u;
+    uint w = ((s >> ((s >> 28u) + 4u)) ^ s) * 277803737u;
+    return (w >> 22u) ^ w;
+}
+
+float rnd(inout uint s) { return float(pcgNext(s) & 0x00FFFFFFu) * (1.0 / 16777216.0); }
+vec2 rnd2(inout uint s) { return vec2(rnd(s), rnd(s)); }
+
+uint hash3(uvec3 v) {
+    uint h = v.x * 0x8da6b343u ^ v.y * 0xd8163841u ^ v.z * 0xcb1ab31fu;
+    h ^= h >> 15u;
+    h *= 0x2c1b3c6du;
+    h ^= h >> 12u;
+    h *= 0x297a2d39u;
+    h ^= h >> 15u;
+    return h;
+}
+
+mat3 buildBasis(vec3 n) {
+    vec3 up = abs(n.z) < 0.999 ? vec3(0.0, 0.0, 1.0) : vec3(1.0, 0.0, 0.0);
+    vec3 t = normalize(cross(up, n));
+    return mat3(t, cross(n, t), n);
+}
+
+vec3 cosineHemisphere(vec3 n, vec2 u) {
+    float r = sqrt(u.x);
+    float phi = 6.28318530718 * u.y;
+    return normalize(buildBasis(n) * vec3(r * cos(phi), r * sin(phi), sqrt(max(0.0, 1.0 - u.x))));
+}
+
+float distributionGGX(float ndh, float alpha) {
+    float a2 = alpha * alpha;
+    float d = ndh * ndh * (a2 - 1.0) + 1.0;
+    return a2 / max(PI * d * d, 1.0e-7);
+}
+
+float geometrySmith(float ndv, float ndl, float alpha) {
+    float k = alpha * 0.5;
+    float gv = ndv / (ndv * (1.0 - k) + k);
+    float gl = ndl / (ndl * (1.0 - k) + k);
+    return gv * gl;
+}
+
+vec3 fresnelSchlick(vec3 f0, float u) {
+    float m = saturate(1.0 - u);
+    float m2 = m * m;
+    return f0 + (vec3(1.0) - f0) * (m2 * m2 * m);
+}
+
+float fresnelDielectric(float cosI, float eta) {
+    float sinI2 = max(0.0, 1.0 - cosI * cosI);
+    float sinT2 = sinI2 / (eta * eta);
+    if (sinT2 >= 1.0) return 1.0;
+    float cosT = sqrt(1.0 - sinT2);
+    float rs = (eta * cosI - cosT) / (eta * cosI + cosT);
+    float rp = (cosI - eta * cosT) / (cosI + eta * cosT);
+    return 0.5 * (rs * rs + rp * rp);
+}
+
+const float GOLDEN_ANGLE = 2.39996323;
+
+vec3 sampleGGX(vec3 n, vec3 v, float roughness, vec2 u) {
+    float alpha = max(roughness * roughness, 0.002);
+    float phi = 6.28318530718 * u.x;
+    float cosTheta = sqrt((1.0 - u.y) / (1.0 + (alpha * alpha - 1.0) * u.y));
+    float sinTheta = sqrt(max(0.0, 1.0 - cosTheta * cosTheta));
+    vec3 h = normalize(buildBasis(n) * vec3(sinTheta * cos(phi), sinTheta * sin(phi), cosTheta));
+    vec3 l = reflect(-v, h);
+    if (dot(l, n) <= 0.0) l = n;
+    return normalize(l);
+}
+
+float brdfSpecularWeight(vec3 n, vec3 v, vec3 l, float roughness) {
+    float ndl = dot(n, l);
+    float ndv = dot(n, v);
+    if (ndl <= 0.0 || ndv <= 0.0) return 0.0;
+    vec3 h = normalize(v + l);
+    float ndh = max(dot(n, h), 0.0);
+    float vdh = max(dot(v, h), 0.0);
+    float alpha = max(roughness * roughness, 0.002);
+    float d = distributionGGX(ndh, alpha);
+    float g = geometrySmith(ndv, ndl, alpha);
+    return d * g * vdh / max(4.0 * ndv, 1.0e-5);
+}
+
+vec3 specularBRDF(vec3 n, vec3 v, vec3 l, vec3 f0, float roughness) {
+    float ndl = max(dot(n, l), 0.0);
+    float ndv = max(dot(n, v), 0.0);
+    if (ndl <= 0.0 || ndv <= 0.0) return vec3(0.0);
+    vec3 h = normalize(v + l);
+    float ndh = max(dot(n, h), 0.0);
+    float vdh = max(dot(v, h), 0.0);
+    float alpha = max(roughness * roughness, 0.002);
+    return distributionGGX(ndh, alpha) * geometrySmith(ndv, ndl, alpha) * fresnelSchlick(f0, vdh) / max(4.0 * ndv * ndl, 1.0e-5);
+}
+
+float hash12(vec2 p) {
+    vec3 p3 = fract(vec3(p.xyx) * 0.1031);
+    p3 += dot(p3, p3.yzx + 33.33);
+    return fract((p3.x + p3.y) * p3.z);
+}
+
+float noise3(vec3 p) {
+    vec3 i = floor(p);
+    vec3 f = fract(p);
+    f = f * f * (3.0 - 2.0 * f);
+    float a = hash12(i.xy + i.z * 13.7);
+    float b = hash12(i.xy + vec2(1.0, 0.0) + i.z * 13.7);
+    float c = hash12(i.xy + vec2(0.0, 1.0) + i.z * 13.7);
+    float d = hash12(i.xy + vec2(1.0, 1.0) + i.z * 13.7);
+    float e = hash12(i.xy + (i.z + 1.0) * 13.7);
+    float g = hash12(i.xy + vec2(1.0, 0.0) + (i.z + 1.0) * 13.7);
+    float h = hash12(i.xy + vec2(0.0, 1.0) + (i.z + 1.0) * 13.7);
+    float k = hash12(i.xy + vec2(1.0, 1.0) + (i.z + 1.0) * 13.7);
+    float x0 = mix(a, b, f.x);
+    float x1 = mix(c, d, f.x);
+    float x2 = mix(e, g, f.x);
+    float x3 = mix(h, k, f.x);
+    return mix(mix(x0, x1, f.y), mix(x2, x3, f.y), f.z);
+}
+
+float fbm(vec3 p) {
+    float v = 0.0;
+    float a = 0.5;
+    for (int i = 0; i < 4; i++) {
+        v += a * noise3(p);
+        p *= 2.03;
+        a *= 0.5;
+    }
+    return v;
+}
+
+vec2 raySphere(vec3 origin, vec3 dir, float radius) {
+    float b = dot(dir, origin);
+    float c = dot(origin, origin) - radius * radius;
+    float d = b * b - c;
+    if (d < 0.0) return vec2(INF, -INF);
+    float s = sqrt(d);
+    return vec2(-b - s, -b + s);
+}
+
+float rayleighPhase(float mu) { return 3.0 / (16.0 * PI) * (1.0 + mu * mu); }
+
+float miePhase(float mu, float g) {
+    float g2 = g * g;
+    float denom = max(1.0 + g2 - 2.0 * g * mu, 1.0e-4);
+    return 3.0 / (8.0 * PI) * ((1.0 - g2) * (1.0 + mu * mu)) / (denom * sqrt(denom) * (2.0 + g2));
+}
+
+vec3 atmosphereOrigin() {
+    float altitudeKm = max(pc.camPos.y - 60.0, 0.0) * 0.001;
+    return vec3(0.0, R_PLANET + altitudeKm + 0.12, 0.0);
+}
+
+const vec3 BETA_O = vec3(0.650e-3, 1.881e-3, 0.085e-3);
+
+float ozoneDensity(float h) {
+    return max(0.0, 1.0 - abs(h - 25.0) / 15.0);
+}
+
+vec3 sunTransmittance(vec3 dir) {
+    vec3 origin = atmosphereOrigin();
+    vec2 hit = raySphere(origin, dir, R_ATMOS);
+    if (hit.y <= 0.0) return vec3(0.0);
+    float total = hit.y;
+    float odR = 0.0;
+    float odM = 0.0;
+    float odO = 0.0;
+    for (int i = 0; i < 8; i++) {
+        float u0 = float(i) / 8.0;
+        float u1 = float(i + 1) / 8.0;
+        float t0 = total * u0 * u0;
+        float t1 = total * u1 * u1;
+        float dt = t1 - t0;
+        vec3 p = origin + dir * (0.5 * (t0 + t1));
+        float h = max(length(p) - R_PLANET, 0.0);
+        odR += exp(-h / H_R) * dt;
+        odM += exp(-h / H_M) * dt;
+        odO += ozoneDensity(h) * dt;
+    }
+    return exp(-(BETA_R * odR + BETA_M * 1.11 * odM + BETA_O * odO));
+}
+
+vec3 atmosphere(vec3 dir, vec3 sun, int steps, int lightSteps) {
+    vec3 origin = atmosphereOrigin();
+    vec2 hit = raySphere(origin, dir, R_ATMOS);
+    if (hit.y <= 0.0) return vec3(0.0);
+    float tStart = max(hit.x, 0.0);
+    float tEnd = hit.y;
+    vec2 ground = raySphere(origin, dir, R_PLANET);
+    if (ground.y > 0.0 && ground.x > 0.0) tEnd = min(tEnd, ground.x);
+    if (tEnd <= tStart) return vec3(0.0);
+
+    float span = tEnd - tStart;
+    float odR = 0.0;
+    float odM = 0.0;
+    float odO = 0.0;
+    vec3 sumR = vec3(0.0);
+    vec3 sumM = vec3(0.0);
+    float mu = dot(dir, sun);
+    vec3 sunE = pc.sunColor.rgb * pc.sunIntensity;
+
+    for (int i = 0; i < steps; i++) {
+        float u0 = float(i) / float(steps);
+        float u1 = float(i + 1) / float(steps);
+        float t0 = tStart + span * u0 * u0;
+        float t1 = tStart + span * u1 * u1;
+        float dt = t1 - t0;
+        vec3 p = origin + dir * (0.5 * (t0 + t1));
+        float h = max(length(p) - R_PLANET, 0.0);
+        float denR = exp(-h / H_R) * dt;
+        float denM = exp(-h / H_M) * dt;
+        odR += denR;
+        odM += denM;
+        odO += ozoneDensity(h) * dt;
+
+        float odLR = 0.0;
+        float odLM = 0.0;
+        float odLO = 0.0;
+        float shadow = 1.0;
+        vec2 lhit = raySphere(p, sun, R_ATMOS);
+        if (lhit.y > 0.0) {
+            vec2 ghit = raySphere(p, sun, R_PLANET);
+            if (ghit.x > 0.0 && ghit.y > 0.0) shadow = 0.0;
+            float ltotal = lhit.y;
+            for (int j = 0; j < lightSteps; j++) {
+                float v0 = float(j) / float(lightSteps);
+                float v1 = float(j + 1) / float(lightSteps);
+                float l0 = ltotal * v0 * v0;
+                float l1 = ltotal * v1 * v1;
+                float ldt = l1 - l0;
+                vec3 lp = p + sun * (0.5 * (l0 + l1));
+                float lh = max(length(lp) - R_PLANET, 0.0);
+                odLR += exp(-lh / H_R) * ldt;
+                odLM += exp(-lh / H_M) * ldt;
+                odLO += ozoneDensity(lh) * ldt;
+            }
+        } else {
+            shadow = 0.0;
+        }
+        vec3 tau = BETA_R * (odR + odLR) + BETA_M * 1.11 * (odM + odLM) + BETA_O * (odO + odLO);
+        vec3 attenuate = exp(-tau) * shadow;
+        sumR += attenuate * denR;
+        sumM += attenuate * denM;
+    }
+
+    vec3 scatter = sumR * BETA_R * rayleighPhase(mu) + sumM * BETA_M * 1.11 * miePhase(mu, 0.76);
+    vec3 multiScatter = (sumR * BETA_R + sumM * BETA_M * 1.4) * (1.0 / (4.0 * PI)) * 0.15;
+    scatter += multiScatter;
+    float rainAmount = saturate(pc.weather.x);
+    float gray = luminance(scatter);
+    scatter = mix(scatter, vec3(gray) * vec3(0.92, 0.95, 1.0), rainAmount * 0.62);
+    scatter += vec3(0.028, 0.031, 0.036) * rainAmount;
+    return sunE * scatter * 5.0 * (1.0 - rainAmount * 0.34);
+}
+
+float starField(vec3 dir) {
+    vec3 d = normalize(dir);
+    float total = 0.0;
+    for (int layer = 0; layer < 2; layer++) {
+        float scale = layer == 0 ? 260.0 : 540.0;
+        vec3 p = d * scale;
+        vec3 cell = floor(p);
+        float h = hash12(cell.xy * 1.37 + cell.z * 47.1 + float(layer) * 13.7);
+        float threshold = layer == 0 ? 0.9950 : 0.9982;
+        if (h <= threshold) continue;
+        vec3 f = fract(p) - 0.5;
+        float t = (h - threshold) / max(1.0 - threshold, 1.0e-4);
+        float twinkle = 0.72 + 0.28 * sin(pc.time * 2.7 + h * 173.0);
+        float core = exp(-dot(f, f) * (layer == 0 ? 11.0 : 19.0));
+        total += core * pow(t, 1.6) * twinkle * (layer == 0 ? 5.5 : 8.0);
+    }
+    vec3 bandAxis = normalize(vec3(0.32, 0.58, -0.75));
+    float band = exp(-pow(abs(dot(d, bandAxis)) * 3.0, 2.0));
+    total += band * fbm(vec3(d * 26.0)) * 0.045;
+    return total;
+}
+
+float cloudDensity(vec3 p, float coverage) {
+    vec3 q = p * 0.0016;
+    q.xz += vec2(pc.time * 0.030, pc.time * 0.011);
+    q.y -= pc.time * 0.006;
+    float base = fbm(vec3(q.x, q.y * 0.35, q.z));
+    float detail = fbm(vec3(q.x * 3.9, q.y, q.z * 3.9));
+    float evolve = fbm(vec3(q.x * 0.55 - pc.time * 0.006, q.y * 0.8 + 11.3, q.z * 0.55 + pc.time * 0.004));
+    float d = base * 0.62 + detail * 0.24 + evolve * 0.14;
+    return saturate((d - (1.0 - coverage)) * 2.4);
+}
+
+vec3 cloudLayer(vec3 origin, vec3 dir, vec3 sun, float coverage) {
+    if (pc.misc.z < 0.5) return vec3(0.0);
+    if (dir.y < 0.09 || coverage <= 0.002) return vec3(0.0);
+    float t0 = (CLOUD_BASE - origin.y) / dir.y;
+    float t1 = (CLOUD_TOP - origin.y) / dir.y;
+    if (t1 <= 0.0) return vec3(0.0);
+    t0 = max(t0, 0.0);
+    t1 = min(t1, t0 + 9000.0);
+    float horizonFade = smoothstep(0.06, 0.18, dir.y);
+    const int CLOUD_STEPS = 4;
+    float stepSize = (t1 - t0) / float(CLOUD_STEPS);
+    float transmittance = 1.0;
+    vec3 sum = vec3(0.0);
+    float mu = dot(dir, sun);
+    float g = mix(0.62, -0.28, 0.35);
+    float hg = (1.0 - g * g) / (12.566371 * pow(max(1.0 + g * g - 2.0 * g * mu, 1.0e-4), 1.5));
+    float phase = mix(hg, miePhase(mu, 0.45), 0.45);
+    vec3 sunE = pc.sunColor.rgb * sunTransmittance(sun) * pc.sunIntensity;
+    float jitter = 0.5 + 0.5 * hash12(vec2(gl_LaunchIDEXT.xy));
+    for (int i = 0; i < CLOUD_STEPS; i++) {
+        vec3 p = origin + dir * (t0 + stepSize * (float(i) + jitter));
+        float density = cloudDensity(p, coverage);
+        if (density <= 0.002) continue;
+        float od = 0.0;
+        for (int j = 0; j < 2; j++) {
+            vec3 lp = p + sun * (26.0 + float(j) * 62.0);
+            od += cloudDensity(lp, coverage) * 62.0;
+        }
+        float lightT = exp(-od * 0.018);
+        float extinction = exp(-density * stepSize * 0.012);
+        sum += transmittance * sunE * phase * lightT * density * stepSize * 0.012;
+        transmittance *= extinction;
+        if (transmittance < 0.02) break;
+    }
+    return sum * horizonFade;
+}
+
+vec3 skyRadiance(vec3 dir, vec3 sun, bool sunDisc, int steps, int lightSteps, bool withClouds) {
+    float coverage = pc.misc.z > 0.5 ? saturate(0.55 + pc.weather.x * 0.35 + pc.weather.y * 0.12) : 0.0;
+    vec3 sky = atmosphere(dir, sun, steps, lightSteps);
+    float night = smoothstep(0.03, -0.12, sun.y);
+    sky += vec3(0.045, 0.058, 0.095) * night * (1.0 - coverage * 0.75);
+    sky += vec3(starField(dir)) * night * (1.0 - coverage) * 0.55;
+
+    if (coverage > 0.002) {
+        sky = sky * exp(-coverage * 0.5);
+        if (withClouds) sky += cloudLayer(pc.camPos.xyz, dir, sun, coverage);
+    }
+
+    if (sunDisc) {
+        float cosAngle = dot(dir, sun);
+        float disc = smoothstep(cos(0.0092), cos(0.0074), cosAngle);
+        float glow = pow(saturate(cosAngle), 900.0);
+        vec3 sunE = pc.sunColor.rgb * sunTransmittance(sun) * pc.sunIntensity;
+        sky += sunE * (disc * 2.6 + glow * 9.0) * saturate(sun.y * 5.0) * (1.0 - coverage * 0.9) * (1.0 - saturate(pc.weather.x) * 0.85);
+        if (sun.y < 0.05) {
+            float moon = smoothstep(0.9994, 0.9998, cosAngle);
+            sky += vec3(0.8, 0.88, 1.0) * moon * 0.55 * night;
+        }
+    }
+
+    if (dir.y < 0.0) {
+        float ground = smoothstep(0.0, -0.06, dir.y);
+        vec3 groundLight = vec3(0.045, 0.05, 0.04) * (pc.sunColor.rgb * max(sun.y, 0.0) * pc.sunIntensity * 0.06 + vec3(0.004));
+        sky = mix(sky, groundLight, ground);
+    }
+    return sky;
+}
+
+vec4 nrdNormalRough(vec3 n, float roughness, float material) {
+    n = n / max(abs(n.x) + abs(n.y) + abs(n.z), 1.0e-5);
+    vec3 r;
+    r.y = n.y * 0.5 + 0.5;
+    r.x = n.x * 0.5 + r.y;
+    r.y -= n.x * 0.5;
+    float rough = max(roughness, 1.5 / 512.0);
+    float s = n.z < 0.0 ? -rough : rough;
+    r.z = s * 0.5 + 0.5;
+    return vec4(r, saturate(material / 3.0));
+}
+
+float waterHeight(vec2 p, float t) {
+    vec2 wind = normalize(vec2(0.82, 0.42));
+    vec2 crossWind = vec2(-wind.y, wind.x);
+    float h = 0.0;
+    h += sin(dot(p, wind) * 0.55 + t * 1.15) * 0.075;
+    h += sin(dot(p, crossWind) * 0.9 - t * 1.6) * 0.05;
+    h += sin(dot(p, normalize(wind + vec2(0.4, -0.2))) * 1.8 + t * 2.4) * 0.032;
+    h += fbm(vec3((p - wind * t * 1.8) * 0.9, t * 0.25)) * 0.09;
+    h += fbm(vec3((p - wind * t * 3.4) * 2.6, t * 0.55)) * 0.035;
+    return h;
+}
+
+vec3 perturbWater(vec3 n, vec3 p, float strength) {
+    float e = 0.03;
+    float t = pc.time;
+    float h0 = waterHeight(p.xz, t);
+    float hx = waterHeight(p.xz + vec2(e, 0.0), t);
+    float hz = waterHeight(p.xz + vec2(0.0, e), t);
+    vec3 tangent = normalize(cross(vec3(0.0, 1.0, 0.0), n) + vec3(1.0e-4, 0.0, 0.0));
+    vec3 bitangent = cross(n, tangent);
+    vec3 grad = tangent * ((hx - h0) / e) + bitangent * ((hz - h0) / e);
+    return normalize(n + grad * strength);
+}
+
+vec3 perturbRipple(vec3 n, vec3 p, float strength) {
+    float t = pc.time * 2.5;
+    float e = 0.04;
+    float h0 = fbm(vec3(p.xz * 6.0, t * 0.4));
+    float hx = fbm(vec3((p.xz + vec2(e, 0.0)) * 6.0, t * 0.4));
+    float hz = fbm(vec3((p.xz + vec2(0.0, e)) * 6.0, t * 0.4));
+    vec3 tangent = normalize(cross(vec3(0.0, 1.0, 0.0), n) + vec3(1.0e-4, 0.0, 0.0));
+    vec3 bitangent = cross(n, tangent);
+    vec3 grad = tangent * ((hx - h0) / e) + bitangent * ((hz - h0) / e);
+    return normalize(n + grad * strength);
+}
+
+bool intersectBox(DynamicObj obj, vec3 origin, vec3 dir, float tMax, out float tHit, out vec3 normal) {
+    vec3 h = vec3(abs(obj.axisXHalf.w), abs(obj.axisYHalf.w), abs(obj.axisZHalf.w));
+    vec3 oc = origin - obj.centerMat.xyz;
+    vec3 invd = 1.0 / (dir + vec3(sign(dir.x) * 1.0e-9 + 1.0e-9,
+                                   sign(dir.y) * 1.0e-9 + 1.0e-9,
+                                   sign(dir.z) * 1.0e-9 + 1.0e-9));
+    vec3 t0 = (-h - oc) * invd;
+    vec3 t1 = (h - oc) * invd;
+    vec3 tmin = min(t0, t1);
+    vec3 tmax = max(t0, t1);
+    float tnear = max(max(tmin.x, tmin.y), tmin.z);
+    float tfar = min(min(tmax.x, tmax.y), tmax.z);
+    if (tfar < max(tnear, 0.0) || tnear > tMax) return false;
+    float t = tnear > 0.0 ? tnear : tfar;
+    if (t > tMax || t <= 0.0) return false;
+    tHit = t;
+    vec3 lp = oc + dir * t;
+    vec3 an = abs(lp) / max(h, vec3(1.0e-4));
+    if (an.x >= an.y && an.x >= an.z) normal = vec3(sign(lp.x), 0.0, 0.0);
+    else if (an.y >= an.z) normal = vec3(0.0, sign(lp.y), 0.0);
+    else normal = vec3(0.0, 0.0, sign(lp.z));
+    if (dot(normal, dir) > 0.0) normal = -normal;
+    return true;
+}
+
+bool traceDynamic(vec3 origin, vec3 dir, float tMax, out RayHit hit) {
+    hit.hit = false;
+    float best = tMax;
+    for (uint i = 0; i < pc.dynamicCount; i++) {
+        if (abs(objs[i].centerMat.w - 12.0) < 0.5) continue;
+        float t;
+        vec3 n;
+        if (!intersectBox(objs[i], origin, dir, best, t, n)) continue;
+        best = t;
+        hit.hit = true;
+        hit.distance = t;
+        hit.position = origin + dir * t;
+        hit.normal = n;
+        hit.albedo = objs[i].color.rgb;
+        hit.emissive = vec3(0.0);
+        hit.material = 8.0;
+        hit.roughness = 0.68;
+        hit.metalness = 0.0;
+        hit.uv = vec2(0.0);
+        hit.skyLight = 1.0;
+        hit.blockLight = 0.0;
+    }
+    return hit.hit;
+}
+
+bool traceParticles(vec3 origin, vec3 dir, float tMax, out RayHit hit) {
+    hit.hit = false;
+    float best = tMax;
+    for (uint i = 0; i < pc.particleCount; i++) {
+        ParticleObj p = particles[i];
+        vec3 oc = origin - p.posRadius.xyz;
+        float radius = max(p.posRadius.w, 0.01);
+        float b = dot(oc, dir);
+        float c = dot(oc, oc) - radius * radius;
+        float d = b * b - c;
+        if (d < 0.0) continue;
+        float t = -b - sqrt(d);
+        if (t < 0.001 || t > best) continue;
+        best = t;
+        hit.hit = true;
+        hit.distance = t;
+        hit.position = origin + dir * t;
+        hit.normal = -dir;
+        hit.albedo = p.colorAlpha.rgb;
+        hit.emissive = p.colorAlpha.rgb * 0.2;
+        hit.material = 0.0;
+        hit.roughness = 0.9;
+        hit.metalness = 0.0;
+        hit.uv = vec2(0.0);
+        hit.skyLight = 1.0;
+        hit.blockLight = 0.0;
+    }
+    return hit.hit;
+}
+
+RayHit traceScene(vec3 origin, vec3 dir, float tMin, float tMax) {
+    RayHit hit;
+    hit.hit = false;
+    hit.distance = tMax;
+    hit.material = -1.0;
+    hit.skyLight = 1.0;
+    hit.blockLight = 0.0;
+
+    payload.op = 0;
+    payload.material = -1.0;
+    payload.distance = tMax;
+    payload.roughness = 0.5;
+    payload.metalness = 0.0;
+    payload.emissive = vec3(0.0);
+    payload.albedo = vec3(0.0);
+    payload.normal = vec3(0.0, 1.0, 0.0);
+    payload.uv = vec2(0.0);
+
+    traceRayEXT(tlas, 0u, 0xFF, 0u, 0u, 0u, origin, tMin, dir, tMax, 0);
+
+    if (payload.material >= 0.0) {
+        hit.hit = true;
+        hit.distance = payload.distance;
+        hit.position = origin + dir * payload.distance;
+        hit.normal = payload.normal;
+        hit.albedo = payload.albedo;
+        hit.emissive = payload.emissive;
+        hit.uv = payload.uv;
+        hit.material = payload.material;
+        hit.roughness = payload.roughness;
+        hit.metalness = payload.metalness;
+        hit.skyLight = payload.skyLight;
+        hit.blockLight = payload.blockLight;
+    }
+
+    RayHit dynHit;
+    if (traceDynamic(origin, dir, hit.distance, dynHit)) hit = dynHit;
+    return hit;
+}
+
+vec3 beamGlow(vec3 origin, vec3 dir, float maxT) {
+    vec3 sum = vec3(0.0);
+    for (uint i = 0; i < pc.dynamicCount; i++) {
+        if (abs(objs[i].centerMat.w - 12.0) > 0.5) continue;
+        vec3 h = vec3(abs(objs[i].axisXHalf.w), abs(objs[i].axisYHalf.w), abs(objs[i].axisZHalf.w));
+        vec3 oc = origin - objs[i].centerMat.xyz;
+        vec3 invd = 1.0 / (dir + vec3(dir.x >= 0.0 ? 1.0e-7 : -1.0e-7, dir.y >= 0.0 ? 1.0e-7 : -1.0e-7,
+                                        dir.z >= 0.0 ? 1.0e-7 : -1.0e-7));
+        vec3 ta = (-h - oc) * invd;
+        vec3 tb = (h - oc) * invd;
+        vec3 tmin = min(ta, tb);
+        vec3 tmax = max(ta, tb);
+        float tn = max(max(max(tmin.x, tmin.y), tmin.z), 0.0);
+        float tf = min(min(min(tmax.x, tmax.y), tmax.z), maxT);
+        if (tf > tn) {
+            vec3 center = objs[i].centerMat.xyz;
+            vec3 mid = origin + dir * ((tn + tf) * 0.5);
+            float flow = fbm(vec3(mid.x * 1.9, mid.y * 0.22 - pc.time * 5.5, mid.z * 1.9));
+            float pulse = 0.7 + 0.3 * sin(pc.time * 2.1 + center.x * 0.11 + center.z * 0.07);
+            float flicker = 0.8 + 0.2 * hash12(vec2(floor(pc.time * 12.0), center.y * 0.37));
+            float density = (0.35 + 1.15 * flow) * pulse * flicker;
+            sum += objs[i].color.rgb * objs[i].color.w * min(tf - tn, 320.0) * 0.03 * density;
+        }
+    }
+    return sum;
+}
+
+float cloudShadow(vec3 origin, vec3 dir) {
+    if (dir.y <= 0.0) return 1.0;
+    float t = (CLOUD_BASE - origin.y) / max(dir.y, 1.0e-3);
+    if (t <= 0.0 || t > 4000.0) return 1.0;
+    vec3 p = origin + dir * t;
+    float cover = saturate(pc.weather.z * 0.35 + 0.5);
+    float density = cloudDensity(p, cover);
+    return exp(-density * 2.2);
+}
+
+vec3 shadowVisibility(vec3 origin, vec3 dir, float maxDistance) {
+    payload.op = 1;
+    payload.transmittance = vec3(1.0);
+    payload.distance = INF;
+    payload.material = -1.0;
+    payload.albedo = vec3(0.0);
+    payload.emissive = vec3(0.0);
+    traceRayEXT(tlas, 0u, 0xFF, 0u, 0u, 0u, origin, 0.003, dir, maxDistance, 0);
+    vec3 tint = payload.distance >= INF * 0.5 ? payload.transmittance * cloudShadow(origin, dir) : vec3(0.0);
+
+    for (uint i = 0; i < pc.dynamicCount; i++) {
+        if (abs(objs[i].centerMat.w - 12.0) < 0.5) continue;
+        float t;
+        vec3 n;
+        if (intersectBox(objs[i], origin, dir, maxDistance, t, n)) return vec3(0.0);
+    }
+    return tint;
+}
+
+float puddleMask(vec3 p, float wet) {
+    if (wet < 0.05) return 0.0;
+    float coarse = fbm(vec3(p.xz * 0.045, 0.0));
+    float fine = fbm(vec3(p.xz * 0.22, 3.1));
+    float m = smoothstep(0.5, 0.62, coarse * 0.7 + fine * 0.3);
+    return m * wet;
+}
+
+vec3 ambientSky(vec3 n, vec3 sun) {
+    float day = saturate(sun.y * 4.0);
+    float dayPower = day * day;
+    vec3 zenith = mix(vec3(0.020, 0.028, 0.052), vec3(0.40, 0.52, 0.90) * pc.sunIntensity * 0.040, dayPower);
+    vec3 ground = mix(vec3(0.009, 0.010, 0.014), vec3(0.22, 0.19, 0.15) * pc.sunIntensity * 0.026, dayPower);
+    float up = saturate(n.y * 0.5 + 0.5);
+    vec3 color = mix(ground, zenith, up);
+    float overcast = saturate(pc.weather.x);
+    color += vec3(0.30, 0.33, 0.38) * overcast * dayPower * mix(0.55, 1.0, up);
+    color += vec3(0.018, 0.020, 0.024) * overcast * (1.0 - dayPower) * mix(0.4, 1.0, up);
+    return color;
+}
+
+float faceShade(vec3 n) {
+    if (n.y > 0.5) return 1.0;
+    if (n.y < -0.5) return 0.52;
+    if (abs(n.x) > 0.5) return 0.66;
+    return 0.80;
+}
+
+vec3 bakedLight(vec3 n, vec3 albedo, vec3 sun, float skyLight, float blockLight) {
+    float shade = faceShade(n);
+    vec3 ambient = ambientSky(n, sun) * (0.25 + 0.75 * skyLight * skyLight) * shade;
+    vec3 torch = vec3(1.0, 0.66, 0.38) * (blockLight * blockLight) * 1.15 * mix(0.55, 1.0, shade);
+    return albedo * (ambient + torch);
+}
+
+vec3 sunLight(vec3 sun) {
+    return pc.sunColor.rgb * sunTransmittance(sun) * pc.sunIntensity;
+}
+
+vec3 keyDir(vec3 sun) {
+    if (sun.y < 0.0) {
+        if (pc.sunIntensity > 2.0) return normalize(vec3(0.35, 0.90, 0.22));
+        vec3 d = normalize(-sun + vec3(0.0, 0.04, 0.0));
+        return normalize(vec3(d.x, max(d.y, 0.12), d.z));
+    }
+    return sun;
+}
+
+vec3 keyIrradiance(vec3 sun) {
+    if (sun.y < 0.0) {
+        if (pc.sunIntensity > 2.0) return vec3(1.0, 0.96, 0.90) * pc.sunIntensity * 0.85;
+        float up = saturate(-sun.y * 3.5);
+        return vec3(0.60, 0.72, 1.05) * (1.9 * up);
+    }
+    return pc.sunColor.rgb * sunTransmittance(sun) * pc.sunIntensity;
+}
+
+vec3 emissionOf(RayHit hit) {
+    if (hit.material == 13.0) {
+        vec2 q = hit.position.xz * 3.0 + hit.position.y * 2.0;
+        float deep = hash12(floor(q * 2.0) + floor(pc.time * 0.35));
+        float layerA = hash12(floor(q * 26.0));
+        float layerB = hash12(floor(q * 64.0) + 19.7);
+        float starA = smoothstep(0.9940, 0.9998, layerA);
+        float starB = smoothstep(0.9975, 0.99995, layerB);
+        float twinkle = 0.45 + 0.55 * sin(pc.time * 2.1 + layerA * 61.0);
+        float swirl = 0.5 + 0.5 * sin((q.x + q.y) * 2.2 + pc.time * 0.9);
+        vec3 base = mix(vec3(0.020, 0.006, 0.045), vec3(0.075, 0.020, 0.150), deep * 0.6 + swirl * 0.4);
+        vec3 stars = vec3(0.82, 0.90, 1.0) * starA * twinkle * 9.0 + vec3(1.0, 0.72, 1.0) * starB * 16.0;
+        float rim = smoothstep(0.0, 0.35, abs(dot(normalize(hit.normal), normalize(hit.position - pc.camPos.xyz))));
+        return base * 1.6 + stars * mix(0.45, 1.0, rim);
+    }
+    if (hit.material == 4.0) return hit.albedo * 1.4;
+    if (hit.material == 5.0) {
+        float flicker = 0.86 + 0.14 * sin(pc.time * 9.0 + dot(hit.position, vec3(6.0, 2.0, 5.0)));
+        return hit.albedo * vec3(1.8, 0.9, 0.3) * flicker * 2.4;
+    }
+    if (hit.material == 6.0) {
+        float flow = 0.72 + 0.28 * fbm(vec3(hit.position.xz * 0.55, pc.time * 0.12));
+        return hit.albedo * vec3(1.6, 0.6, 0.13) * flow * 1.8;
+    }
+    if (hit.material == 7.0) return hit.albedo * vec3(1.4, 0.78, 0.33) * 1.5;
+    return vec3(0.0);
+}
+
+vec3 traceRadiance(vec3 origin, vec3 dir, int depth, inout uint rng, vec3 sunE);
+
+LobeResult shadeSurface(RayHit hit, vec3 viewDir, vec3 sun, vec3 sunE, inout uint rng, int depth) {
+    LobeResult result;
+    result.diffuse = vec3(0.0);
+    result.specular = vec3(0.0);
+    result.specDistance = hit.distance;
+    result.normal = hit.normal;
+    result.roughness = saturate(hit.roughness);
+
+    vec3 n = hit.normal;
+    vec3 albedo = hit.albedo;
+    float roughness = saturate(hit.roughness);
+    float metalness = saturate(hit.metalness);
+
+    if (hit.material == 9.0) roughness = max(roughness, 0.5);
+
+    if (pc.wetness > 0.02 && n.y > 0.5 && hit.material == 0.0) {
+        float wet = saturate(pc.wetness);
+        roughness = mix(roughness, 0.42, wet * 0.4);
+        albedo *= mix(1.0, 0.76, wet * 0.6);
+        float puddle = puddleMask(hit.position, wet);
+        if (puddle > 0.001) {
+            roughness = mix(roughness, 0.03, puddle);
+            albedo *= mix(1.0, 0.42, puddle);
+            n = perturbRipple(n, hit.position, puddle * 0.3);
+        }
+    }
+
+    result.normal = n;
+    result.roughness = roughness;
+
+    vec3 f0 = mix(vec3(0.04), albedo, metalness);
+    vec3 diffuseAlbedo = albedo * (1.0 - metalness);
+
+    if (metalness > 0.4) roughness = max(roughness, 0.32);
+    vec3 shadow = shadowVisibility(hit.position + n * 0.012, sun, 96.0);
+    float ndl = max(dot(n, sun), 0.0);
+    float ndv = max(dot(n, viewDir), 1.0e-4);
+    if (ndl > 0.0 && luminance(shadow) > 0.0) {
+        vec3 spec = specularBRDF(n, viewDir, sun, f0, roughness) * ndl;
+        vec3 diff = diffuseAlbedo / PI * ndl;
+        result.diffuse += diff * sunE * shadow;
+        result.specular += spec * sunE * shadow;
+    }
+    vec3 tangentA = normalize(cross(n, abs(n.y) > 0.9 ? vec3(1.0, 0.0, 0.0) : vec3(0.0, 1.0, 0.0)));
+    vec3 tangentB = cross(n, tangentA);
+    vec3 occA = shadowVisibility(hit.position + n * 0.02, normalize(n + tangentA * 0.85), 2.2);
+    vec3 occB = shadowVisibility(hit.position + n * 0.02, normalize(n + tangentB * 0.85), 2.2);
+    float contact = 1.0 - 0.30 * (1.0 - saturate(luminance(occA))) - 0.30 * (1.0 - saturate(luminance(occB)));
+    result.diffuse += bakedLight(n, albedo, sun, hit.skyLight, hit.blockLight) * contact;
+
+    if (depth < int(pc.maxBounces)) {
+        vec3 ddir = cosineHemisphere(n, rnd2(rng));
+        vec3 indirect = traceRadiance(hit.position + n * 0.012, ddir, depth + 1, rng, sunE);
+        result.diffuse += min(indirect * diffuseAlbedo, vec3(6.0));
+
+        vec3 rdir = sampleGGX(n, viewDir, max(roughness, 0.02), rnd2(rng));
+        if (dot(rdir, n) > 0.0) {
+            float w = min(brdfSpecularWeight(n, viewDir, rdir, roughness), 24.0);
+            float fr = fresnelSchlick(f0, max(dot(viewDir, normalize(viewDir + rdir)), 0.0)).x;
+            if (w * fr > 1.0e-5) {
+                result.specular += min(traceRadiance(hit.position + n * 0.012, rdir, depth + 1, rng, sunE) * w * fr, vec3(18.0));
+                result.specDistance = hit.distance;
+            }
+        }
+    }
+    result.diffuse = min(result.diffuse, vec3(28.0));
+    result.specular = min(result.specular, vec3(18.0));
+    return result;
+}
+
+vec3 traceRadiance(vec3 origin, vec3 dir, int depth, inout uint rng, vec3 sunE) {
+    vec3 throughput = vec3(1.0);
+    vec3 radiance = vec3(0.0);
+    vec3 worldSun = normalize(pc.sunDir.xyz);
+    vec3 sun = worldSun;
+    if (worldSun.y < 0.0) {
+        sun = keyDir(worldSun);
+        sunE = keyIrradiance(worldSun);
+    }
+    vec3 o = origin;
+    vec3 d = dir;
+
+    for (int bounce = depth; bounce <= int(pc.maxBounces) + 1; bounce++) {
+        RayHit hit = traceScene(o, d, 0.002, pc.rayLength * 6.0);
+        radiance += throughput * beamGlow(o, d, hit.hit ? hit.distance : pc.rayLength * 6.0);
+        if (!hit.hit) {
+            radiance += throughput * skyRadiance(d, worldSun, false, 4, 2, false);
+            break;
+        }
+        vec3 emission = emissionOf(hit);
+        radiance += throughput * emission;
+        if (hit.material == 4.0 || hit.material == 5.0 || hit.material == 6.0 || hit.material == 7.0) break;
+
+        vec3 viewDir = -d;
+        vec3 n = hit.normal;
+        vec3 albedo = hit.albedo;
+        float roughness = saturate(hit.roughness);
+        float metalness = saturate(hit.metalness);
+        if (hit.material == 9.0) roughness = max(roughness, 0.5);
+        if (pc.wetness > 0.02 && n.y > 0.5 && hit.material == 0.0) {
+            float wet = saturate(pc.wetness);
+            roughness = mix(roughness, 0.42, wet * 0.4);
+            albedo *= mix(1.0, 0.76, wet * 0.6);
+            float puddle = puddleMask(hit.position, wet);
+            if (puddle > 0.001) {
+                float rainRipple = saturate(pc.weather.x);
+                roughness = mix(roughness, 0.05, puddle);
+                albedo *= mix(1.0, 0.36, puddle);
+                n = perturbRipple(n, hit.position, puddle * mix(0.08, 0.34, rainRipple));
+            }
+        }
+
+        vec3 f0 = mix(vec3(0.04), albedo, metalness);
+        vec3 diffuseAlbedo = albedo * (1.0 - metalness);
+
+        vec3 shadow = depth >= 2 ? vec3(1.0) : shadowVisibility(hit.position + n * 0.012, sun, 96.0);
+        float ndl = max(dot(n, sun), 0.0);
+        float ndv = max(dot(n, viewDir), 1.0e-4);
+        if (ndl > 0.0 && luminance(shadow) > 0.0) {
+            vec3 spec = specularBRDF(n, viewDir, sun, f0, roughness) * ndl;
+            radiance += throughput * (diffuseAlbedo / PI * ndl + spec) * sunE * shadow;
+        }
+        radiance += throughput * bakedLight(n, albedo, sun, hit.skyLight, hit.blockLight);
+
+        if (bounce >= int(pc.maxBounces)) {
+            if (hit.material == 3.0 || hit.material == 2.0) {
+                float ior = hit.material == 3.0 ? 1.333 : 1.52;
+                float f = fresnelDielectric(max(dot(-d, n), 0.0), ior);
+                vec3 rdir = normalize(reflect(d, n));
+                vec3 skyRefl = skyRadiance(rdir, sun, false, 6, 3, false);
+                radiance += throughput * f * skyRefl * (hit.material == 3.0 ? vec3(0.86, 0.94, 1.0) : albedo);
+            }
+            break;
+        }
+
+        float fres = 1.0;
+        float specProb = 0.0;
+        if (hit.material == 3.0 || hit.material == 2.0) {
+            float ior = hit.material == 3.0 ? 1.333 : 1.52;
+            fres = fresnelDielectric(max(dot(-d, n), 0.0), ior);
+            specProb = 1.0;
+        } else {
+            specProb = saturate(luminance(f0) * 1.4 + roughness * 0.12);
+            if (metalness > 0.5) specProb = 1.0;
+        }
+
+        if (hit.material == 3.0 || hit.material == 2.0) {
+            float ior = hit.material == 3.0 ? 1.333 : 1.52;
+            if (rnd(rng) < fres) {
+                vec3 rdir = sampleGGX(n, viewDir, max(roughness, hit.material == 3.0 ? 0.075 : 0.03), rnd2(rng));
+                throughput *= hit.material == 3.0 ? vec3(0.98) : albedo;
+                o = hit.position + n * 0.015;
+                d = rdir;
+            } else {
+                vec3 tdir = refract(d, n, 1.0 / ior);
+                if (dot(tdir, tdir) < 0.25) {
+                    o = hit.position + n * 0.015;
+                    d = reflect(d, n);
+                    throughput *= hit.material == 3.0 ? vec3(0.98) : albedo;
+                } else {
+                    o = hit.position - n * 0.02;
+                    d = normalize(tdir);
+                    throughput *= hit.material == 3.0 ? vec3(0.72, 0.9, 0.96) : albedo * vec3(0.95, 0.98, 0.97);
+                }
+            }
+        } else if (rnd(rng) < specProb) {
+            vec3 rdir = sampleGGX(n, viewDir, max(roughness, 0.02), rnd2(rng));
+            if (dot(rdir, n) <= 0.0) break;
+            float w = min(brdfSpecularWeight(n, viewDir, rdir, roughness), 24.0);
+            float fr = fresnelSchlick(f0, max(dot(viewDir, normalize(viewDir + rdir)), 0.0)).x;
+            throughput *= fr * w / max(specProb, 0.02);
+            o = hit.position + n * 0.012;
+            d = rdir;
+        } else {
+            throughput *= diffuseAlbedo / max(1.0 - specProb, 0.02);
+            o = hit.position + n * 0.012;
+            d = cosineHemisphere(n, rnd2(rng));
+        }
+
+        if (bounce > 1) {
+            float q = saturate(luminance(throughput) * 2.0);
+            if (q < 0.05) break;
+            if (rnd(rng) > q) break;
+            throughput /= q;
+        }
+    }
+    return radiance;
+}
+
+vec3 makeCameraRayDir(vec2 uv) {
+    vec3 dir = normalize(pc.camDir.xyz);
+    vec3 up = normalize(pc.camUp.xyz);
+    vec3 right = normalize(cross(dir, up));
+    up = cross(right, dir);
+    float tanHalf = tan(radians(pc.fov) * 0.5);
+    vec2 ndc = uv * 2.0 - 1.0;
+    return normalize(dir + right * (ndc.x * tanHalf * pc.aspect) + up * (ndc.y * tanHalf));
+}
+
+vec2 projectPrev(vec3 worldPos) {
+    vec3 pdir = normalize(pc.prevCamDir.xyz);
+    vec3 pup = normalize(pc.prevCamUp.xyz);
+    vec3 pright = normalize(cross(pdir, pup));
+    pup = cross(pright, pdir);
+    vec3 rel = worldPos - pc.prevCamPos.xyz;
+    float z = dot(rel, pdir);
+    if (z <= 0.002) return vec2(-1.0);
+    float tanHalf = tan(radians(pc.lens.x) * 0.5);
+    float x = dot(rel, pright) / (z * tanHalf * max(pc.lens.y, 0.02));
+    float y = dot(rel, pup) / (z * tanHalf);
+    return vec2(x * 0.5 + 0.5, y * 0.5 + 0.5);
+}
+
+vec2 projectPrevDirection(vec3 dir) {
+    vec3 pdir = normalize(pc.prevCamDir.xyz);
+    vec3 pup = normalize(pc.prevCamUp.xyz);
+    vec3 pright = normalize(cross(pdir, pup));
+    pup = cross(pright, pdir);
+    float z = dot(dir, pdir);
+    if (z <= 0.002) return vec2(-1.0);
+    float tanHalf = tan(radians(pc.lens.x) * 0.5);
+    float x = dot(dir, pright) / (z * tanHalf * max(pc.lens.y, 0.02));
+    float y = dot(dir, pup) / (z * tanHalf);
+    return vec2(x * 0.5 + 0.5, y * 0.5 + 0.5);
+}
+
+float fogExtinction() {
+    return 0.00085 + pc.weather.x * 0.0021 + pc.weather.y * 0.0016;
+}
+
+float rainStreaks(vec3 origin, vec3 dir) {
+    float rain = saturate(pc.weather.x);
+    if (rain < 0.02) return 0.0;
+    vec3 p = origin + dir * 7.5;
+    vec2 g = vec2(p.x * 2.6 + p.z * 2.1, p.y * 0.62 + pc.time * 11.0);
+    vec2 cell = floor(g);
+    vec2 f = fract(g);
+    float h = hash12(cell);
+    float lane = smoothstep(0.06, 0.0, abs(f.x - 0.5 + (h - 0.5) * 0.7));
+    float fall = smoothstep(0.55, 0.98, f.y) * smoothstep(0.0, 0.10, f.y);
+    return lane * fall * (0.35 + 0.65 * h) * rain;
+}
+
+vec3 applyFog(vec3 color, vec3 origin, vec3 dir, float distance, vec3 sun, vec3 skyAmbient) {
+    float travelled = min(distance, 1200.0);
+    float rainFog = saturate(pc.weather.x);
+    float densityScale = 0.62 + rainFog * 2.4 + saturate(pc.weather.y) * 1.3;
+    float od = 0.0;
+    float inscatterWeight = 0.0;
+    float segment = travelled / 6.0;
+    for (int i = 0; i < 6; i++) {
+        float s = (float(i) + 0.5) * segment;
+        vec3 p = origin + dir * s;
+        float height = max(p.y - 60.0, 0.0);
+        float density = exp(-height / 620.0) * densityScale;
+        float stepOd = density * segment * 0.0011;
+        od += stepOd;
+        inscatterWeight += stepOd * exp(-od * 0.5);
+    }
+    float transmittance = exp(-od);
+    float phaseR = rayleighPhase(dot(dir, sun));
+    float phaseM = miePhase(dot(dir, sun), 0.72);
+    float nearFade = 1.0 - exp(-distance * 0.0022);
+    vec3 skyTint = skyAmbient * (0.30 + rainFog * 0.55);
+    vec3 sunTint = pc.sunColor.rgb * 0.22 * (1.0 - rainFog * 0.85);
+    vec3 inscatter = (skyTint * (0.45 + phaseR * 0.55) + sunTint * phaseM * 0.9) * inscatterWeight * nearFade * 0.42;
+    return color * transmittance + inscatter;
+}
+
+void main() {
+    ivec2 pixel = ivec2(gl_LaunchIDEXT.xy);
+    ivec2 size = ivec2(gl_LaunchSizeEXT.xy);
+    if (pixel.x >= size.x || pixel.y >= size.y) return;
+
+    vec3 worldSun = normalize(pc.sunDir.xyz);
+    vec3 sun = keyDir(worldSun);
+    vec3 sunE = keyIrradiance(worldSun);
+    uint rng = hash3(uvec3(uint(pixel.x), uint(pixel.y), pc.frameIndex)) | 1u;
+
+    int spp = max(int(pc.samplesPerPixel), 1);
+    vec3 diffAccum = vec3(0.0);
+    vec3 specAccum = vec3(0.0);
+    float diffDist = pc.rayLength * 6.0;
+    float specDist = pc.rayLength * 6.0;
+    vec3 normalAccum = vec3(0.0, 1.0, 0.0);
+    float primaryMaterial = 0.0;
+    float roughnessAccum = 0.5;
+    float viewZ = pc.rayLength * 6.0;
+    vec2 motion = vec2(0.0);
+    bool primaryHit = false;
+    vec3 primaryDir = vec3(0.0, 1.0, 0.0);
+    float primaryDistance = pc.rayLength * 6.0;
+
+    for (int s = 0; s < spp; s++) {
+        vec2 jitter = pc.lens.zw;
+        if (s > 0) {
+            jitter = vec2(hash12(vec2(pixel) + float(s) * 1.7 + float(pc.frameIndex) * 0.31),
+                          hash12(vec2(pixel) + float(s) * 2.3 + float(pc.frameIndex) * 0.57)) - 0.5;
+        }
+        vec2 baseUv = (vec2(pixel) + 0.5) / vec2(size);
+        vec2 uv = (vec2(pixel) + 0.5 + jitter) / vec2(size);
+        vec3 dir = makeCameraRayDir(uv);
+        RayHit hit = traceScene(pc.camPos.xyz, dir, 0.01, pc.rayLength * 8.0);
+        diffAccum += beamGlow(pc.camPos.xyz, dir, hit.hit ? hit.distance : pc.rayLength * 8.0);
+        vec3 viewDir = -dir;
+
+        if (!hit.hit) {
+            vec3 sky = skyRadiance(dir, worldSun, true, 5, 2, true);
+            if (dir.y < 0.06) {
+                vec3 haze = ambientSky(vec3(0.0, 1.0, 0.0), sun) * 1.5;
+                sky = mix(haze, sky, saturate(dir.y / 0.06 + 0.12));
+            }
+            float skyFog = exp(-0.00022 * pc.rayLength);
+            diffAccum += sky * skyFog;
+            specAccum += vec3(0.0);
+            if (s == 0) {
+                motion = (projectPrevDirection(dir) - baseUv) * vec2(size);
+                viewZ = pc.rayLength * 8.0;
+                normalAccum = -dir;
+                roughnessAccum = 0.08;
+                primaryDir = dir;
+                primaryDistance = pc.rayLength * 8.0;
+            }
+            continue;
+        }
+
+        if (s == 0) {
+            primaryHit = true;
+            primaryDir = dir;
+            primaryDistance = hit.distance;
+            viewZ = dot(hit.position - pc.camPos.xyz, normalize(pc.camDir.xyz));
+            normalAccum = hit.normal;
+            roughnessAccum = saturate(hit.roughness);
+            primaryMaterial = hit.material;
+            motion = (projectPrev(hit.position) - baseUv) * vec2(size);
+        }
+
+        vec3 n = hit.normal;
+        vec3 albedo = hit.albedo;
+        float material = hit.material;
+        float roughness = saturate(hit.roughness);
+        float metalness = saturate(hit.metalness);
+
+        if (material == 3.0) {
+            n = perturbWater(n, hit.position, 1.0);
+            float cosI = max(dot(viewDir, n), 0.0);
+            float fres = fresnelDielectric(cosI, 1.333);
+            float rough = max(roughness, 0.055);
+            vec3 rdir = sampleGGX(n, viewDir, rough, rnd2(rng));
+            vec3 refl = traceRadiance(hit.position + n * 0.02, rdir, 1, rng, sunE);
+            vec3 tdir = normalize(refract(dir, n, 1.0 / 1.333));
+            vec3 refr = vec3(0.0);
+            float refrDist = 6.0;
+            if (dot(tdir, tdir) > 0.25) {
+                RayHit under = traceScene(hit.position - n * 0.04, tdir, 0.02, 24.0);
+                if (under.hit) {
+                    float skyAmb = luminance(ambientSky(under.normal, sun)) * 0.85;
+                    float lightAmount = max(dot(under.normal, sun), 0.0) * luminance(sunE) / PI + skyAmb;
+                    refr = under.albedo * lightAmount * exp(-vec3(0.35, 0.09, 0.045) * under.distance * 0.55);
+                    refrDist = under.distance;
+                } else {
+                    refr = skyRadiance(tdir, sun, false, 4, 2, false) * 0.4;
+                }
+            } else {
+                refr = refl * 0.2;
+            }
+            vec3 waterTint = vec3(0.74, 0.90, 0.97);
+            diffAccum += refr * (1.0 - fres) * waterTint * 0.05;
+            specAccum += (refl * fres + refr * (1.0 - fres) * waterTint) * 0.98;
+            diffDist = hit.distance;
+            specDist = min(refrDist, hit.distance + 12.0);
+        } else if (material == 2.0 || material == 10.0) {
+            bool gem = material == 10.0;
+            float iorGreen = gem ? 2.10 : 1.52;
+            float dispersion = gem ? 0.055 : 0.018;
+            vec3 tint = gem ? mix(albedo, vec3(1.0), 0.55) : albedo;
+            n = perturbRipple(n, hit.position, gem ? 0.05 : 0.12);
+            float cosI = max(dot(viewDir, n), 0.0);
+            float fres = fresnelDielectric(cosI, iorGreen);
+            vec3 rdir = sampleGGX(n, viewDir, max(roughness, 0.02), rnd2(rng));
+            vec3 refl = traceRadiance(hit.position + n * 0.02, rdir, 1, rng, sunE);
+
+            float refrDist = 4.0;
+            vec3 refrRed = vec3(0.0);
+            vec3 refrGreen = vec3(0.0);
+            vec3 refrBlue = vec3(0.0);
+            vec3 tdirG = normalize(refract(dir, n, 1.0 / iorGreen));
+            vec3 tdirR = normalize(refract(dir, n, 1.0 / (iorGreen * (1.0 - dispersion))));
+            vec3 tdirB = normalize(refract(dir, n, 1.0 / (iorGreen * (1.0 + dispersion))));
+            if (dot(tdirG, tdirG) > 0.25) {
+                RayHit underG = traceScene(hit.position - n * 0.04, tdirG, 0.02, 16.0);
+                float absorption = gem ? 0.35 : 0.6;
+                if (underG.hit) {
+                    float skyAmb = luminance(ambientSky(underG.normal, sun)) * 0.8;
+                    float lightAmount = max(dot(underG.normal, sun), 0.0) * luminance(sunE) / PI + skyAmb;
+                    vec3 base = underG.albedo * lightAmount * exp(-tint * underG.distance * absorption) * tint;
+                    refrGreen = base;
+                    refrRed = base * exp(-tint * underG.distance * absorption * (1.0 - dispersion) * 2.0);
+                    refrBlue = base * exp(-tint * underG.distance * absorption * (1.0 + dispersion) * 2.0);
+                    refrDist = underG.distance;
+                } else {
+                    vec3 skyG = skyRadiance(tdirG, sun, false, 4, 2, false) * tint;
+                    vec3 skyR = skyRadiance(tdirR, sun, false, 4, 2, false) * tint;
+                    vec3 skyB = skyRadiance(tdirB, sun, false, 4, 2, false) * tint;
+                    refrGreen = skyG;
+                    refrRed = skyR;
+                    refrBlue = skyB;
+                }
+            }
+            vec3 refr = vec3(refrRed.r, refrGreen.g, refrBlue.b);
+            diffAccum += refr * (1.0 - fres) * (gem ? 0.22 : 0.15);
+            specAccum += (refl * fres + refr * (1.0 - fres) * (gem ? 0.9 : 0.85));
+            diffDist = hit.distance;
+            specDist = refrDist;
+        } else if (material == 8.0) {
+            vec3 shadow = shadowVisibility(hit.position + n * 0.012, sun, 96.0);
+            vec3 lit = albedo * (sunE * max(dot(n, sun), 0.0) * luminance(shadow) / PI * 1.2 + vec3(0.25));
+            if (spp > 0) {
+                vec3 ddir = cosineHemisphere(n, rnd2(rng));
+                lit += traceRadiance(hit.position + n * 0.012, ddir, 1, rng, sunE) * albedo;
+            }
+            diffAccum += lit;
+            diffDist = hit.distance;
+            specDist = hit.distance;
+        } else {
+            LobeResult lobe = shadeSurface(hit, viewDir, sun, sunE, rng, 1);
+            diffAccum += lobe.diffuse;
+            specAccum += lobe.specular;
+            diffDist = hit.distance;
+            specDist = lobe.specDistance;
+            normalAccum = lobe.normal;
+            roughnessAccum = lobe.roughness;
+        }
+    }
+
+    diffAccum /= float(spp);
+    specAccum /= float(spp);
+
+    if (primaryHit) {
+        vec3 fogAmbient = skyRadiance(primaryDir, sun, false, 3, 2, false);
+        float streak = rainStreaks(pc.camPos.xyz, primaryDir);
+    diffAccum += sunE * streak * 0.05 + ambientSky(primaryDir, sun) * streak * 0.22;
+    diffAccum = applyFog(diffAccum, pc.camPos.xyz, primaryDir, primaryDistance, sun, fogAmbient);
+        specAccum = applyFog(specAccum, pc.camPos.xyz, primaryDir, primaryDistance, sun, fogAmbient);
+    }
+
+    float rainAmount = saturate(pc.weather.x);
+    if (rainAmount > 0.02) {
+        float viewDistance = min(primaryHit ? primaryDistance : pc.rayLength * 2.0, 48.0);
+        const int RAIN_STEPS = 6;
+        float sigma = rainAmount * 0.011;
+        float dt = viewDistance / float(RAIN_STEPS);
+        float jitter = hash12(gl_LaunchIDEXT.xy + float(pc.frameIndex) * 0.6180339);
+        float mu = dot(primaryDir, sun);
+        float g = 0.72;
+        float hg = (1.0 - g * g) / (12.566 * pow(1.0 + g * g - 2.0 * g * mu, 1.5));
+        vec3 sunTerm = sunLight(sun) * hg * 6.0;
+        vec3 skyTerm = ambientSky(vec3(0.0, 1.0, 0.0), sun) * 1.8;
+        vec3 inscatter = vec3(0.0);
+        float transmittance = 1.0;
+        for (int i = 0; i < RAIN_STEPS; i++) {
+            float s = (float(i) + jitter) * dt;
+            vec3 rp = pc.camPos.xyz + primaryDir * s;
+            float cells = fbm(vec3(rp.x * 0.55 + pc.time * 2.3, rp.y * 0.45 - pc.time * 5.1, rp.z * 0.55 + pc.time * 1.1));
+            float density = exp(-max(rp.y - 52.0, 0.0) * 0.011) * mix(0.30, 1.0, saturate(cells));
+            float extinction = sigma * density * dt;
+            float stepTransmittance = exp(-extinction);
+            inscatter += transmittance * (1.0 - stepTransmittance) * (sunTerm + skyTerm);
+            transmittance *= stepTransmittance;
+            if (transmittance < 0.03) break;
+        }
+        transmittance = max(transmittance, 0.42);
+        diffAccum = diffAccum * transmittance + inscatter;
+        specAccum *= transmittance;
+    }
+
+    diffAccum = min(diffAccum, vec3(300.0));
+    specAccum = min(specAccum, vec3(300.0));
+
+    float specLum = luminance(specAccum);
+    float specLimit = max(0.9, luminance(sunE) * 0.35 + 0.45);
+    if (specLum > specLimit) specAccum *= specLimit / max(specLum, 1.0e-6);
+
+    float sampleLum = luminance(diffAccum + specAccum);
+    float lumLimit = max(4.0, luminance(sunE) * 0.55 + 1.5);
+    if (sampleLum > lumLimit) {
+        float fireflyScale = lumLimit / sampleLum;
+        diffAccum *= fireflyScale;
+        specAccum *= fireflyScale;
+    }
+
+    imageStore(outDiffuse, pixel, vec4(diffAccum, diffDist));
+    imageStore(outSpecular, pixel, vec4(specAccum, specDist));
+    imageStore(outNormalRough, pixel, nrdNormalRough(normalize(normalAccum), roughnessAccum, primaryMaterial));
+    imageStore(outViewZ, pixel, vec4(max(viewZ, 0.0), 0.0, 0.0, 0.0));
+    imageStore(outMotion, pixel, vec4(motion, 0.0, 0.0));
+}

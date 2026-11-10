@@ -1,12 +1,12 @@
 package com.fish.yaoguang.client.gui;
 
 public enum RayTracingPreset {
-    LOW("低", 1, 1, true, 0.5f, false),
-    MEDIUM("中", 2, 2, true, 1.0f, false),
-    HIGH("高", 4, 4, true, 1.0f, false),
-    ULTRA("极致", 8, 8, false, 1.2f, true),
-    CINEMATIC("电影", 16, 16, false, 1.5f, true),
-    CUSTOM("自定义", 3, 3, true, 1.0f, false);
+    LOW("低", 1, 1, true, 0.36f, true),
+    MEDIUM("中", 2, 1, true, 0.42f, true),
+    HIGH("高", 3, 1, true, 0.42f, true),
+    ULTRA("极致", 3, 1, true, 0.46f, true),
+    CINEMATIC("电影", 4, 1, true, 0.50f, true),
+    CUSTOM("自定义", 2, 1, true, 0.42f, true);
 
     private final String displayName;
     private final int maxBounces;

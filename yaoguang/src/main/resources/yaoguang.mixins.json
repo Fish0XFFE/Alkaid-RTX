@@ -6,11 +6,11 @@
   "refmap": "yaoguang.refmap.json",
   "client": [
     "ScreenInvoker",
+    "LevelRendererInvoker",
+    "ParticleAccessor",
+    "ParticleEngineAccessor",
     "MixinVideoSettingsScreen",
-    "MixinLevelRenderer",
-    "MixinEntityRenderer",
-    "MixinParticleEngine",
-    "ParticleAccessor"
+    "MixinLevelRenderer"
   ],
   "injectors": {
     "defaultRequire": 1
